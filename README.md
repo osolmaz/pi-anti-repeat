@@ -1,68 +1,141 @@
-# pi-loop-guard
+# pi-anti-repeat
 
-pi-loop-guard is an extension for the [Pi coding agent](https://github.com/earendil-works/pi) that
-stops an agent that is stuck in a loop. When you turn it on, it notices when the agent keeps
-repeating the same work and tells the model to change its approach before more time is lost.
+pi-anti-repeat is an extension for the [Pi coding agent](https://github.com/earendil-works/pi) that
+stops an agent that is stuck repeating itself. It watches the model's streamed thinking and its
+finished runs, and when the same work keeps coming back, it cuts the response off and tells the
+model to change its approach.
 
-Loop Guard watches streamed reasoning and finalized agent turns after you enable it. It uses deterministic, bounded fingerprints and action features. It does not call another model, inspect the filesystem, use the network, or scan the complete session transcript.
+It catches loops inside a single thought as it streams. In one recorded case a model spent 74
+seconds writing the same five sentences about 375 times. Replayed through the detector, that
+response is stopped after 866 words, about 5 seconds in. It also catches runs that end with the
+same outcome or the same error again and again.
 
 ## Install
 
 ```bash
-pi install git:github.com/osolmaz/pi-loop-guard
+pi install git:github.com/osolmaz/pi-anti-repeat
 ```
 
-Run `/reload` in an open Pi session to load it. Add `@<commit>` or `@<tag>` to the source to pin a
-version.
+Run `/reload` in an open Pi session to load it. Add `@<commit>` or `@<tag>` to pin a version.
+
+Anti-Repeat is on from the start of every session. Use `/anti-repeat off` to turn it off for the
+current session. Nothing is saved between sessions.
+
+## Detection and correction
+
+On the first detection in an epoch, Anti-Repeat sends one visible `anti-repeat` message. The
+message tells the model to stop the current approach and restate what it has verified before it
+chooses a different next action. If the repetition was in streamed thinking, the response is cut off first and the message
+starts a new turn. On a second detection in the same epoch, it stops the run and sends nothing else.
+
+An epoch starts with each new instruction from you. Short prompts such as "continue" or "go ahead"
+keep the current epoch, so a loop cannot hide behind them.
+
+These checks trigger a detection:
+
+- Three separate 96-word passages each appear three times in one streamed thought. Case,
+  punctuation, whitespace, and Unicode composition do not matter.
+- The same cycle of one to four run outcomes repeats three times.
+- The same error ends three runs in a row.
+- Four runs started by "continue" prompts repeat at least 85% of the same actions.
+
+A long run on its own never triggers anything. Work that keeps making different progress continues.
 
 ## Commands
 
 ```text
-/loop-guard on
-/loop-guard off
-/loop-guard status
-/loop-guard reset
-/loop-guard nudge
+/anti-repeat status
+/anti-repeat off
+/anti-repeat on
+/anti-repeat reset
 ```
 
-The extension starts off after every load, reload, or session replacement. `/loop-guard on` starts a fresh in-memory detection epoch. A substantive user instruction also starts a fresh epoch. Short continuation prompts remain in the current epoch.
+`reset` starts a new epoch, which also clears a stop.
 
-## Detection
+## Cost
 
-Loop Guard intervenes after one of these bounded conditions:
+The thinking check runs on every streamed chunk, so it is built to be cheap. Each word is hashed
+once and the window hash is updated in place, so the cost per word does not depend on the window
+size. Streaming 1 MB of thinking through the detector takes about 24 ms, or about 0.6 microseconds
+per 24-character chunk. The listener is removed while Anti-Repeat is off, paused, or stopped. Memory
+stays bounded at 2,048 tracked windows per response and twelve run summaries.
 
-- Three separate 96-token reasoning windows each appear three times while one assistant response is streaming.
-- An exact outcome cycle of length one through four repeats three times.
-- The same terminal error occurs three times.
-- Four continuation-led episodes have at least 85% adjacent action similarity.
+Anti-Repeat never stores raw model output, thinking text, or tool content. The corrective message is the only
+session entry it adds.
 
-Turn and episode counts alone never trigger an intervention. Long agent runs continue while their reasoning, outcomes, actions, and errors remain materially distinct.
+## Use it from code
 
-Matching on streamed reasoning ignores differences in letter case, and it splits words on punctuation and whitespace. Fuzzy action similarity never triggers by itself.
+Pi distributions can create the extension with their own options instead of installing the default:
 
-## Intervention policy
+```typescript
+import { createAntiRepeat } from "pi-anti-repeat";
 
-The first detection sends one visible `pi-loop-guard` message. It tells the model to stop the current approach and restate what it has verified. The model must then name the work that turned out wrong and choose a materially different action. A streamed-reasoning detection aborts the looping provider response immediately, then starts one corrective follow-up after Pi settles. Other active-run detections are delivered as steering.
+export default createAntiRepeat({
+  enabled: true,
+  command: "anti-repeat", // or false for no command
+  status: "anti-repeat", // footer status key, or false
+  notify: true,
+  detectors: {
+    reasoning: { windowWords: 96, repeats: 3, matchedWindows: 3 },
+    repeatedError: false, // turn one detector off
+  },
+  policy: ({ detection, corrections, activeResponse }) => (corrections === 0 ? "correct" : "stop"),
+  message: (detection) => "You are repeating yourself. Try a different approach.",
+  isContinuation: (text) => /^(continue|go on)$/i.test(text.trim()),
+});
+```
 
-A second detection in the same epoch trips the guard. It does not send another model message. If the agent is active, Loop Guard aborts it and waits for substantive user direction or `/loop-guard reset`.
+The policy returns `ignore`, `notify`, `correct`, or `stop` for each detection. The default corrects
+once and then stops. Invalid options throw when `createAntiRepeat` is called.
 
-Loop Guard emits `pi-loop-guard` events on `pi.events` with a `nudge` or `trip` action and `version: 1`. An extension that queues its own automatic runs can listen for them and pause before it starts another run.
+The detectors are also available without Pi from `pi-anti-repeat/core`:
 
-## State and performance
+```typescript
+import { RepeatDetector } from "pi-anti-repeat/core";
 
-Disabled handlers return before collecting detector state. Enabled episode state is bounded to twelve digests, sixteen turns per episode, thirty-two tool actions per episode, and 256 hashed action features. Streamed reasoning state keeps one 96-token rolling window and at most 2,048 content-selected hashes. Loop Guard keeps no raw model output, reasoning text, or tool content.
+const detector = new RepeatDetector();
+detector.startReasoning();
+for (const delta of stream) {
+  const detection = detector.observeReasoning(delta);
+  if (detection !== null) break;
+}
+```
 
-The package persists no settings or detector state. The visible intervention message is the only session entry it adds.
+## Events for other extensions
+
+Anti-Repeat reports on the `anti-repeat` channel of `pi.events`. Each event has `version: 1`, a
+`type` (`detected`, `corrected`, `stopped`, `reset`, `enabled`, or `disabled`), the current `epoch`,
+and the `detection` when there is one. An extension that continues runs on its own should pause when
+it sees `stopped`.
+
+Other extensions can control it on the `anti-repeat:control` channel:
+
+```typescript
+import { ANTI_REPEAT_CONTROL_CHANNEL } from "pi-anti-repeat/protocol";
+
+pi.events.emit(ANTI_REPEAT_CONTROL_CHANNEL, {
+  version: 1,
+  action: "ignore-next-run", // or "pause", "resume", "reset"
+  source: "my-extension",
+});
+```
+
+Send `ignore-next-run` just before you restart a run on purpose, for example after cutting off a
+response, so the regenerated thinking is not counted as a repeat.
 
 ## Development
 
 ```bash
+npm ci
 npm run check
-npm run slophammer
+npm run smoke
+npm run replay -- ~/.pi/agent/sessions/<dir>/<session>.jsonl
 ```
 
-Mutation testing remains manual:
+`smoke` starts a real Pi process with a fake model whose thinking loops, and checks that
+Anti-Repeat cuts it off and the model answers after the correction. `replay` runs the thinking in local session files through the detector and prints which responses
+it would flag and how far into each one. It never prints session text. Mutation testing is manual:
+`npm run mutate`.
 
-```bash
-npm run mutate
-```
+Anti-Repeat needs Pi 0.87.0 or later. The design and the evidence behind the defaults are in
+[docs/2026-10-02-anti-repeat-library-plan.md](docs/2026-10-02-anti-repeat-library-plan.md).

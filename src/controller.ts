@@ -1,428 +1,451 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 
-import { EpisodeBuilder } from "./feature-encoder.ts";
+import type { Detection } from "./core/detection.ts";
+import { RepeatDetector } from "./core/index.ts";
+import { correctionText, detectionLabel } from "./message.ts";
+import type { AntiRepeatAction, ResolvedOptions } from "./options.ts";
 import {
-  decisionLabel,
-  interventionContent,
-  LOOP_GUARD_EVENT,
-  LOOP_GUARD_MESSAGE_TYPE,
-  type LoopGuardEvent,
-} from "./intervention-message.ts";
-import { LoopDetector, type LoopDecision } from "./loop-detector.ts";
-import { ThinkingStreamDetector } from "./thinking-stream-detector.ts";
+  ANTI_REPEAT_EVENT_CHANNEL,
+  ANTI_REPEAT_MESSAGE_TYPE,
+  ANTI_REPEAT_PROTOCOL_VERSION,
+  type AntiRepeatControl,
+  type AntiRepeatEvent,
+  type AntiRepeatEventType,
+  type AntiRepeatMessageDetails,
+} from "./protocol.ts";
 
-export type LoopGuardState = "off" | "armed" | "nudged" | "tripped";
+const MAX_MESSAGE_CHARACTERS = 4_000;
+const ACTIONS: readonly AntiRepeatAction[] = ["ignore", "notify", "correct", "stop"];
 
-const STATUS_KEY = "loop-guard";
-const CONTINUATION_CLAUSES = [
-  "keep going",
-  "carry on",
-  "go ahead",
-  "you decide",
-  "you choose",
-  "proceed",
-  "continue",
-  "resume",
-  "go on",
-  "do it",
-] as const;
-const CONTINUATION_JOINERS = ["and", "then"] as const;
-const POLITE_WORDS = ["please", "now"] as const;
+export type ControllerRuntime = Pick<ExtensionAPI, "events" | "sendMessage">;
 
-function consumePrefix(value: string, candidates: readonly string[]): string | undefined {
-  for (const candidate of candidates) {
-    if (value === candidate) return "";
-    if (value.startsWith(`${candidate} `)) return value.slice(candidate.length + 1);
-  }
-  return undefined;
-}
-
-function trimPoliteWords(value: string): string {
-  let remaining = value;
-  let changed = true;
-  while (changed && remaining.length > 0) {
-    changed = false;
-    for (const word of POLITE_WORDS) {
-      if (remaining === word) return "";
-      if (remaining.startsWith(`${word} `)) {
-        remaining = remaining.slice(word.length + 1);
-        changed = true;
-      }
-      if (remaining.endsWith(` ${word}`)) {
-        remaining = remaining.slice(0, -(word.length + 1));
-        changed = true;
-      }
-    }
-  }
-  return remaining;
-}
-
-export function isContinuationPrompt(text: string): boolean {
-  let remaining = trimPoliteWords(
-    text
-      .normalize("NFKC")
-      .toLowerCase()
-      .replaceAll(/[^\p{L}\p{N}\s]+/gu, " ")
-      .replaceAll(/\s+/gu, " ")
-      .trim(),
-  );
-  let clauses = 0;
-  while (remaining.length > 0 && clauses < 3) {
-    const afterClause = consumePrefix(remaining, CONTINUATION_CLAUSES);
-    if (afterClause === undefined) return false;
-    clauses += 1;
-    remaining = trimPoliteWords(afterClause);
-    const afterJoiner = consumePrefix(remaining, CONTINUATION_JOINERS);
-    if (afterJoiner === "") return false;
-    if (afterJoiner !== undefined) remaining = trimPoliteWords(afterJoiner);
-  }
-  return clauses > 0 && remaining.length === 0;
-}
-
-function stateStatus(state: LoopGuardState): string | undefined {
-  switch (state) {
-    case "off":
-      return undefined;
-    case "armed":
-      return "loop guard: on";
-    case "nudged":
-      return "loop guard: nudged";
-    case "tripped":
-      return "loop guard: tripped";
-  }
-}
-
-type LoopGuardRuntime = Pick<ExtensionAPI, "events" | "sendMessage">;
-type LoopGuardContext = Pick<ExtensionContext, "abort" | "hasPendingMessages" | "isIdle"> & {
-  ui: Pick<ExtensionContext["ui"], "notify" | "setStatus">;
-};
-type LoopGuardInputEvent = {
-  source: "extension" | "interactive" | "rpc";
-  streamingBehavior?: "followUp" | "steer";
-  text: string;
-};
-type LoopGuardMessageStartEvent = {
-  message: unknown;
-};
-type LoopGuardMessageUpdateEvent = {
-  assistantMessageEvent: {
-    delta?: string;
-    type: string;
-  };
-};
-type LoopGuardTurnEndEvent = {
-  message: unknown;
-  toolResults: readonly unknown[];
-};
-type LoopGuardAgentEndEvent = {
-  messages: readonly unknown[];
+export type ControllerContext = Pick<
+  ExtensionContext,
+  "abort" | "hasPendingMessages" | "isIdle"
+> & {
+  readonly ui: Pick<ExtensionContext["ui"], "notify" | "setStatus">;
 };
 
-function isAssistantMessage(value: unknown): boolean {
+/** Adds the stream listener and returns a function that removes it. */
+export type StreamSubscriber = () => () => void;
+
+export type InputEvent = {
+  readonly source: "extension" | "interactive" | "rpc";
+  readonly streamingBehavior?: "followUp" | "steer";
+  readonly text: string;
+};
+
+export type StreamEvent = {
+  readonly assistantMessageEvent: { readonly type: string; readonly delta?: string };
+};
+
+export type CorrectionEntry = {
+  readonly type: "custom_message";
+  readonly customType: string;
+  readonly content: string;
+  readonly display: boolean;
+  readonly details: AntiRepeatMessageDetails;
+};
+
+export type BoundaryResult = { readonly entries: CorrectionEntry[]; readonly continue: true };
+
+export type AntiRepeatState = "off" | "paused" | "watching" | "corrected" | "stopped";
+
+function isAssistant(message: unknown): boolean {
   return (
-    typeof value === "object" &&
-    value !== null &&
-    !Array.isArray(value) &&
-    Reflect.get(value, "role") === "assistant"
+    typeof message === "object" && message !== null && Reflect.get(message, "role") === "assistant"
   );
 }
 
-export class LoopGuardController {
-  private readonly detector = new LoopDetector();
-  private episode: EpisodeBuilder | null = null;
-  private episodeContinuationPrompt = false;
+function isAction(value: unknown): value is AntiRepeatAction {
+  return ACTIONS.some((action) => action === value);
+}
+
+/**
+ * Connects Pi's lifecycle events to the detectors and carries out the policy.
+ *
+ * One epoch runs from the last substantive user instruction, reset, or enable. Detection stops for
+ * the rest of an epoch after a `stop`. Nothing is persisted.
+ */
+export class AntiRepeatController {
+  private readonly options: ResolvedOptions;
+  private readonly runtime: ControllerRuntime;
+  private readonly subscribeStream: StreamSubscriber;
+  private readonly detector: RepeatDetector;
+  private context: ControllerContext | null = null;
+  private corrections = 0;
+  private enabled = false;
   private epoch = 0;
-  private nextContinuationPrompt = false;
-  private pendingStreamingNudge: LoopDecision | null = null;
-  private restartEpisodeOnNextTurn = false;
-  private skipCurrentEpisodeAtSettle = false;
-  private stateValue: LoopGuardState = "off";
-  private suppressCurrentThinking = false;
-  private readonly thinkingDetector = new ThinkingStreamDetector();
+  private ignoreNextRun = false;
+  private nextRunContinuation = false;
+  private paused = false;
+  private pendingCorrection: Detection | null = null;
+  private responseFinished = false;
+  private restartRunAtTurn = false;
+  private skipRun = false;
+  private stopped = false;
+  private unsubscribeStream: (() => void) | null = null;
 
-  constructor(private readonly pi: LoopGuardRuntime) {}
+  constructor(
+    options: ResolvedOptions,
+    runtime: ControllerRuntime,
+    subscribeStream: StreamSubscriber,
+  ) {
+    this.options = options;
+    this.runtime = runtime;
+    this.subscribeStream = subscribeStream;
+    this.detector = new RepeatDetector(options.detectors);
+  }
 
-  get state(): LoopGuardState {
-    return this.stateValue;
+  get state(): AntiRepeatState {
+    if (!this.enabled) return "off";
+    if (this.paused) return "paused";
+    if (this.stopped) return "stopped";
+    return this.corrections > 0 ? "corrected" : "watching";
   }
 
   get statusText(): string {
-    switch (this.stateValue) {
+    switch (this.state) {
       case "off":
-        return "Loop Guard is off.";
-      case "armed":
-        return `Loop Guard is on and observing epoch ${String(this.epoch)}.`;
-      case "nudged":
-        return "Loop Guard sent one corrective message and will trip on the next detection.";
-      case "tripped":
-        return "Loop Guard is tripped and will not send another corrective message.";
+        return "Anti-Repeat is off.";
+      case "paused":
+        return "Anti-Repeat is paused by another extension.";
+      case "watching":
+        return `Anti-Repeat is watching epoch ${String(this.epoch)}.`;
+      case "corrected":
+        return "Anti-Repeat sent one correction and will stop the run if the repetition continues.";
+      case "stopped":
+        return "Anti-Repeat stopped this epoch. Give a new instruction or run reset to watch again.";
     }
   }
 
-  sessionStart(ctx: LoopGuardContext): void {
-    this.disable(ctx, false);
+  /** True when streamed reasoning of the current response should be checked. */
+  private get checkingResponse(): boolean {
+    return this.collecting && !this.responseFinished && !this.skipRun;
   }
 
-  sessionShutdown(ctx: LoopGuardContext): void {
-    this.disable(ctx, false);
+  /** True when lifecycle events should be recorded. */
+  private get collecting(): boolean {
+    return this.enabled && !this.paused && !this.stopped;
   }
 
-  enable(ctx: LoopGuardContext): void {
-    this.stateValue = "armed";
-    this.startEpoch();
-    this.updateStatus(ctx);
-    ctx.ui.notify("Loop Guard enabled for a fresh detection epoch.", "info");
+  // Session and user control -----------------------------------------------------------------
+
+  sessionStart(ctx: ControllerContext): void {
+    this.context = ctx;
+    this.paused = false;
+    this.ignoreNextRun = false;
+    this.enabled = this.options.enabled;
+    this.startEpoch(false);
+    this.refresh();
   }
 
-  disable(ctx: LoopGuardContext, notify = true): void {
-    this.stateValue = "off";
-    this.clearRuntime();
-    this.updateStatus(ctx);
-    if (notify) ctx.ui.notify("Loop Guard disabled.", "info");
+  sessionShutdown(ctx: ControllerContext): void {
+    this.context = ctx;
+    this.enabled = false;
+    this.startEpoch(false);
+    this.refresh();
+    this.context = null;
   }
 
-  reset(ctx: LoopGuardContext): void {
-    if (this.stateValue === "off") {
-      ctx.ui.notify("Loop Guard is off. Use /loop-guard on first.", "warning");
+  setEnabled(enabled: boolean, ctx: ControllerContext): void {
+    this.context = ctx;
+    this.enabled = enabled;
+    this.startEpoch(true);
+    this.refresh();
+    this.emit(enabled ? "enabled" : "disabled");
+    this.notify(enabled ? "Anti-Repeat is on." : "Anti-Repeat is off.", "info");
+  }
+
+  reset(ctx: ControllerContext): void {
+    this.context = ctx;
+    if (!this.enabled) {
+      this.notify("Anti-Repeat is off. Turn it on first.", "warning");
       return;
     }
-    this.stateValue = "armed";
-    this.startEpoch();
-    this.updateStatus(ctx);
-    ctx.ui.notify("Loop Guard started a fresh detection epoch.", "info");
+    this.startEpoch(true);
+    this.refresh();
+    this.emit("reset");
+    this.notify("Anti-Repeat started a new epoch.", "info");
   }
 
-  manualNudge(ctx: LoopGuardContext): void {
-    if (this.stateValue === "off") {
-      ctx.ui.notify("Loop Guard is off. Use /loop-guard on first.", "warning");
+  control(message: AntiRepeatControl): void {
+    switch (message.action) {
+      case "pause":
+        this.paused = true;
+        this.skipRun = this.detector.runOpen || this.skipRun;
+        break;
+      case "resume":
+        this.paused = false;
+        break;
+      case "reset":
+        if (this.enabled) {
+          this.startEpoch(true);
+          this.emit("reset");
+        }
+        break;
+      case "ignore-next-run":
+        this.ignoreNextRun = true;
+        break;
+    }
+    this.refresh();
+  }
+
+  // Pi lifecycle ------------------------------------------------------------------------------
+
+  input(event: InputEvent, ctx: ControllerContext): void {
+    this.context = ctx;
+    if (!this.enabled || this.paused || event.source === "extension") return;
+    if (this.isContinuation(event.text)) {
+      this.nextRunContinuation = true;
       return;
     }
-    this.stateValue = "armed";
-    this.startEpoch();
-    this.processDecision({ kind: "manual_nudge" }, ctx, !ctx.isIdle());
+    const wasActive = this.stopped || this.corrections > 0 || this.detector.runOpen;
+    this.startEpoch(true);
+    this.refresh();
+    if (wasActive) this.emit("reset");
   }
 
-  input(event: LoopGuardInputEvent, ctx: LoopGuardContext): void {
-    if (this.stateValue === "off" || event.source === "extension") return;
-    const continuation = isContinuationPrompt(event.text);
-    this.nextContinuationPrompt = continuation;
-    if (continuation) return;
-    this.stateValue = "armed";
-    this.startEpoch(event.streamingBehavior !== undefined);
-    this.updateStatus(ctx);
-  }
-
-  agentStart(): void {
-    if (!this.isCollecting() || this.episode !== null) return;
-    this.episode = new EpisodeBuilder();
-    this.episodeContinuationPrompt = this.nextContinuationPrompt;
-    this.nextContinuationPrompt = false;
-    this.thinkingDetector.reset();
-  }
-
-  messageStart(event: LoopGuardMessageStartEvent): void {
-    if (!this.isCollecting() || !isAssistantMessage(event.message)) return;
-    this.suppressCurrentThinking = false;
-    this.thinkingDetector.reset();
-  }
-
-  messageUpdate(event: LoopGuardMessageUpdateEvent, ctx: LoopGuardContext): void {
-    if (!this.isCollecting() || this.restartEpisodeOnNextTurn || this.suppressCurrentThinking) {
-      return;
+  runStart(): void {
+    if (!this.collecting || this.restartRunAtTurn || this.detector.runOpen) return;
+    if (this.ignoreNextRun) {
+      this.ignoreNextRun = false;
+      this.skipRun = true;
     }
-    const streamEvent = event.assistantMessageEvent;
-    let decision: LoopDecision | null = null;
-    if (streamEvent.type === "thinking_delta" && typeof streamEvent.delta === "string") {
-      decision = this.thinkingDetector.observe(streamEvent.delta);
-    } else if (streamEvent.type === "thinking_end") {
-      decision = this.thinkingDetector.finish();
-    }
-    if (decision !== null) this.processStreamingDecision(decision, ctx);
+    this.detector.startRun(this.nextRunContinuation);
+    this.nextRunContinuation = false;
   }
 
   turnStart(): void {
-    if (!this.isCollecting() || !this.restartEpisodeOnNextTurn) return;
-    this.episode = new EpisodeBuilder();
-    this.episodeContinuationPrompt = false;
-    this.restartEpisodeOnNextTurn = false;
+    if (!this.collecting) return;
+    if (this.restartRunAtTurn) {
+      // The user gave new direction mid-run: count only what happens from this turn on.
+      this.restartRunAtTurn = false;
+      this.detector.startRun(false);
+      return;
+    }
+    this.runStart();
   }
 
-  turnEnd(event: LoopGuardTurnEndEvent): void {
-    if (!this.isCollecting() || this.episode === null) return;
-    this.episode.accountTurn(event.message, event.toolResults);
+  messageStart(message: unknown): void {
+    if (!this.collecting || !isAssistant(message)) return;
+    this.detector.startReasoning();
+    this.responseFinished = false;
   }
 
-  agentEnd(event: LoopGuardAgentEndEvent): void {
-    if (!this.isCollecting() || this.episode === null) return;
-    this.episode.accountAgentEnd(event.messages);
+  /** Called for every streamed event while the stream listener is subscribed. */
+  messageUpdate(event: StreamEvent, ctx: ControllerContext): void {
+    const update = event.assistantMessageEvent;
+    if (update.type !== "thinking_delta" && update.type !== "thinking_end") return;
+    if (!this.checkingResponse) return;
+    const detection =
+      update.type === "thinking_delta"
+        ? this.detector.observeReasoning(update.delta ?? "")
+        : this.detector.endReasoning();
+    if (detection !== null) this.handleResponseDetection(detection, ctx);
   }
 
-  agentSettled(ctx: LoopGuardContext): void {
-    if (this.stateValue === "off") return;
-    if (this.episode === null) {
-      this.restartEpisodeOnNextTurn = false;
-      this.skipCurrentEpisodeAtSettle = false;
-    } else {
-      const episode = this.episode;
-      this.episode = null;
-      if (this.restartEpisodeOnNextTurn) {
-        this.restartEpisodeOnNextTurn = false;
-      } else if (this.skipCurrentEpisodeAtSettle) {
-        this.skipCurrentEpisodeAtSettle = false;
-      } else {
-        const decision = this.detector.observe(episode.finish(this.episodeContinuationPrompt));
-        this.episodeContinuationPrompt = false;
-        if (decision !== null) this.processDecision(decision, ctx, false);
+  turnEnd(message: unknown, toolResults: readonly unknown[]): void {
+    if (!this.collecting || this.skipRun || this.restartRunAtTurn) return;
+    this.runStart();
+    this.detector.recordTurn(message, toolResults);
+  }
+
+  agentEnd(messages: readonly unknown[]): void {
+    if (!this.collecting || this.skipRun || this.restartRunAtTurn) return;
+    this.detector.recordRunEnd(messages);
+  }
+
+  /** Checks the finished run. A correction is returned for Pi to commit before it continues. */
+  beforeSettle(ctx: ControllerContext): BoundaryResult | undefined {
+    this.context = ctx;
+    const detection = this.closeRun();
+    if (detection === null) return undefined;
+    const action = this.decide(detection, false);
+    if (action === "stop") {
+      this.stop(detection, false, ctx);
+      return undefined;
+    }
+    if (action !== "correct") return undefined;
+    this.beginCorrection(detection);
+    return { continue: true, entries: [this.correctionEntry(detection)] };
+  }
+
+  /** Runs after an aborted run, which skips `beforeSettle`, and delivers a pending correction. */
+  settled(ctx: ControllerContext): void {
+    this.context = ctx;
+    const detection = this.closeRun();
+    if (detection !== null) {
+      const action = this.decide(detection, false);
+      if (action === "stop") this.stop(detection, false, ctx);
+      if (action === "correct") {
+        this.beginCorrection(detection);
+        this.pendingCorrection = detection;
       }
     }
-    this.deliverPendingStreamingNudge(ctx);
+    this.responseFinished = false;
+    this.restartRunAtTurn = false;
+    this.skipRun = false;
+    this.deliverPendingCorrection(ctx);
   }
 
-  private isCollecting(): boolean {
-    return this.stateValue === "armed" || this.stateValue === "nudged";
-  }
+  // Decisions ---------------------------------------------------------------------------------
 
-  private processDecision(decision: LoopDecision, ctx: LoopGuardContext, activeRun: boolean): void {
-    if (this.stateValue === "tripped" || this.stateValue === "off") return;
-    if (this.stateValue === "nudged") {
-      this.trip(decision, ctx, activeRun);
+  private handleResponseDetection(detection: Detection, ctx: ControllerContext): void {
+    this.context = ctx;
+    this.responseFinished = true;
+    const action = this.decide(detection, true);
+    if (action === "stop") {
+      this.stop(detection, true, ctx);
       return;
     }
-    this.nudge(decision, ctx, activeRun);
-  }
-
-  private processStreamingDecision(decision: LoopDecision, ctx: LoopGuardContext): void {
-    if (this.stateValue === "tripped" || this.stateValue === "off") return;
-    if (this.stateValue === "nudged") {
-      this.trip(decision, ctx, true);
-      return;
-    }
-
-    this.stateValue = "nudged";
-    this.detector.reset();
-    this.thinkingDetector.reset();
-    this.nextContinuationPrompt = false;
-    this.pendingStreamingNudge = decision;
-    this.skipCurrentEpisodeAtSettle = true;
-    this.suppressCurrentThinking = true;
-    this.updateStatus(ctx);
-    this.emit("nudge", decision);
+    if (action !== "correct") return;
+    this.beginCorrection(detection);
+    this.pendingCorrection = detection;
+    this.skipRun = true;
     ctx.abort();
-    ctx.ui.notify(`Loop Guard aborted the response after ${decisionLabel(decision)}.`, "warning");
+    this.notify(`Anti-Repeat cut off the response after ${detectionLabel(detection)}.`, "warning");
   }
 
-  private nudge(decision: LoopDecision, ctx: LoopGuardContext, activeRun: boolean): void {
-    this.stateValue = "nudged";
-    this.detector.reset();
-    this.thinkingDetector.reset();
-    this.nextContinuationPrompt = false;
-    this.skipCurrentEpisodeAtSettle = activeRun;
-    this.updateStatus(ctx);
-
-    if (!this.sendIntervention(decision, ctx, activeRun)) {
-      this.failIntervention(decision, ctx, activeRun);
-      return;
+  /** Emits `detected`, asks the policy, and shows a notification when asked to. */
+  private decide(detection: Detection, activeResponse: boolean): AntiRepeatAction {
+    this.emit("detected", detection);
+    let action: AntiRepeatAction = "notify";
+    try {
+      const chosen = this.options.policy({
+        activeResponse,
+        corrections: this.corrections,
+        detection,
+      });
+      if (isAction(chosen)) action = chosen;
+    } catch {
+      this.notify("The Anti-Repeat policy failed; only notifying.", "error");
     }
-    this.emit("nudge", decision);
-    ctx.ui.notify(`Loop Guard intervened after ${decisionLabel(decision)}.`, "warning");
+    if (action === "notify")
+      this.notify(`Anti-Repeat detected ${detectionLabel(detection)}.`, "warning");
+    return action;
   }
 
-  private deliverPendingStreamingNudge(ctx: LoopGuardContext): void {
-    const decision = this.pendingStreamingNudge;
-    if (decision === null || this.stateValue !== "nudged") return;
-    this.pendingStreamingNudge = null;
-    if (!this.sendIntervention(decision, ctx, false)) {
-      this.failIntervention(decision, ctx, false);
-      return;
+  private beginCorrection(detection: Detection): void {
+    this.corrections += 1;
+    this.refresh();
+    this.emit("corrected", detection);
+  }
+
+  private stop(detection: Detection, activeResponse: boolean, ctx: ControllerContext): void {
+    this.stopped = true;
+    this.pendingCorrection = null;
+    this.detector.discardRun();
+    if (activeResponse) {
+      this.skipRun = true;
+      ctx.abort();
     }
-    ctx.ui.notify(
-      "Loop Guard started one corrective follow-up after aborting the loop.",
-      "warning",
+    this.refresh();
+    this.emit("stopped", detection);
+    this.notify(
+      `Anti-Repeat stopped after ${detectionLabel(detection)}. Give a new instruction to continue.`,
+      "error",
     );
   }
 
-  private sendIntervention(
-    decision: LoopDecision,
-    ctx: LoopGuardContext,
-    activeRun: boolean,
-  ): boolean {
-    const message = {
-      customType: LOOP_GUARD_MESSAGE_TYPE,
-      content: interventionContent(decision),
-      details: { decision, version: 1 as const },
-      display: true,
-    };
+  private closeRun(): Detection | null {
+    if (!this.detector.runOpen) return null;
+    if (!this.collecting || this.skipRun) {
+      this.detector.discardRun();
+      return null;
+    }
+    return this.detector.finishRun();
+  }
+
+  private deliverPendingCorrection(ctx: ControllerContext): void {
+    const detection = this.pendingCorrection;
+    this.pendingCorrection = null;
+    if (detection === null || !this.enabled || this.stopped) return;
+    const entry = this.correctionEntry(detection);
     try {
-      if (activeRun) {
-        this.pi.sendMessage(message, { deliverAs: "steer" });
-      } else {
-        this.pi.sendMessage(message, {
-          deliverAs: "followUp",
-          triggerTurn: ctx.isIdle() && !ctx.hasPendingMessages(),
-        });
-      }
-      return true;
+      this.runtime.sendMessage(entry, {
+        deliverAs: "followUp",
+        triggerTurn: ctx.isIdle() && !ctx.hasPendingMessages(),
+      });
+    } catch {
+      this.stop(detection, false, ctx);
+      this.notify("Anti-Repeat could not send its correction.", "error");
+    }
+  }
+
+  private correctionEntry(detection: Detection): CorrectionEntry {
+    let content: string;
+    try {
+      content = this.options.message(detection);
+    } catch {
+      content = correctionText(detection);
+    }
+    if (content.length === 0) content = correctionText(detection);
+    return {
+      content: content.slice(0, MAX_MESSAGE_CHARACTERS),
+      customType: ANTI_REPEAT_MESSAGE_TYPE,
+      details: { detection, version: ANTI_REPEAT_PROTOCOL_VERSION },
+      display: true,
+      type: "custom_message",
+    };
+  }
+
+  // State helpers -----------------------------------------------------------------------------
+
+  private isContinuation(text: string): boolean {
+    try {
+      return this.options.isContinuation(text);
     } catch {
       return false;
     }
   }
 
-  private failIntervention(
-    decision: LoopDecision,
-    ctx: LoopGuardContext,
-    activeRun: boolean,
-  ): void {
-    this.stateValue = "tripped";
-    this.pendingStreamingNudge = null;
-    this.thinkingDetector.reset();
-    this.updateStatus(ctx);
-    this.emit("trip", decision);
-    if (activeRun) ctx.abort();
-    ctx.ui.notify("Loop Guard could not deliver its intervention and tripped safely.", "error");
+  /**
+   * Starts a new epoch and forgets all evidence. When it happens in the middle of a run, the rest
+   * of the current response is not checked and counting restarts at the next turn.
+   */
+  private startEpoch(duringSession: boolean): void {
+    const runInProgress = duringSession && this.detector.runOpen;
+    this.epoch += 1;
+    this.corrections = 0;
+    this.stopped = false;
+    this.pendingCorrection = null;
+    this.nextRunContinuation = false;
+    this.detector.reset();
+    this.restartRunAtTurn = runInProgress;
+    this.responseFinished = runInProgress;
+    if (!duringSession) this.skipRun = false;
   }
 
-  private trip(decision: LoopDecision, ctx: LoopGuardContext, activeRun: boolean): void {
-    this.stateValue = "tripped";
-    this.detector.reset();
-    this.pendingStreamingNudge = null;
-    this.thinkingDetector.reset();
-    this.skipCurrentEpisodeAtSettle = activeRun;
-    this.suppressCurrentThinking = true;
-    this.updateStatus(ctx);
-    this.emit("trip", decision);
-    if (activeRun) ctx.abort();
-    ctx.ui.notify(
-      "Loop Guard tripped. Automatic intervention stopped; give substantive direction or run /loop-guard reset.",
-      "error",
+  private refresh(): void {
+    const want = this.collecting;
+    if (want && this.unsubscribeStream === null) this.unsubscribeStream = this.subscribeStream();
+    if (!want && this.unsubscribeStream !== null) {
+      this.unsubscribeStream();
+      this.unsubscribeStream = null;
+    }
+    if (this.options.status === false || this.context === null) return;
+    const state = this.state;
+    this.context.ui.setStatus(
+      this.options.status,
+      state === "off" ? undefined : `anti-repeat: ${state}`,
     );
   }
 
-  private emit(action: LoopGuardEvent["action"], decision: LoopDecision): void {
-    const event: LoopGuardEvent = { action, decision, version: 1 };
-    this.pi.events.emit(LOOP_GUARD_EVENT, event);
+  private emit(type: AntiRepeatEventType, detection?: Detection): void {
+    const event: AntiRepeatEvent =
+      detection === undefined
+        ? { epoch: this.epoch, type, version: ANTI_REPEAT_PROTOCOL_VERSION }
+        : { detection, epoch: this.epoch, type, version: ANTI_REPEAT_PROTOCOL_VERSION };
+    try {
+      this.runtime.events.emit(ANTI_REPEAT_EVENT_CHANNEL, event);
+    } catch {
+      // A failing listener in another extension must not change what Anti-Repeat does.
+    }
   }
 
-  private startEpoch(preserveActiveEpisode = false): void {
-    const activeEpisode = preserveActiveEpisode ? this.episode : null;
-    this.epoch += 1;
-    this.clearRuntime();
-    this.episode = activeEpisode;
-    this.restartEpisodeOnNextTurn = preserveActiveEpisode;
-  }
-
-  private clearRuntime(): void {
-    this.detector.reset();
-    this.thinkingDetector.reset();
-    this.episode = null;
-    this.episodeContinuationPrompt = false;
-    this.nextContinuationPrompt = false;
-    this.pendingStreamingNudge = null;
-    this.restartEpisodeOnNextTurn = false;
-    this.skipCurrentEpisodeAtSettle = false;
-    this.suppressCurrentThinking = false;
-  }
-
-  private updateStatus(ctx: LoopGuardContext): void {
-    ctx.ui.setStatus(STATUS_KEY, stateStatus(this.stateValue));
+  private notify(message: string, level: "info" | "warning" | "error"): void {
+    if (!this.options.notify || this.context === null) return;
+    this.context.ui.notify(message, level);
   }
 }
