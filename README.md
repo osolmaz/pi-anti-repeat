@@ -18,7 +18,8 @@ pi install git:github.com/osolmaz/pi-anti-repeat
 
 Run `/reload` in an open Pi session to load it. Add `@<commit>` or `@<tag>` to pin a version.
 
-Anti-Repeat is on from the start of every session. Use `/anti-repeat off` to turn it off for the
+Anti-Repeat is on from the start of every session. It shows nothing in the footer while it is
+only watching; the status line appears after it corrects or stops a run. Use `/anti-repeat off` to turn it off for the
 current session. Nothing is saved between sessions.
 
 ## Detection and correction
