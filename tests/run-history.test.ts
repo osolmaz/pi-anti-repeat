@@ -1,12 +1,19 @@
 import { describe, expect, it } from "vitest";
 
-import { MAX_EPISODES, type EpisodeDigest } from "./feature-encoder.ts";
-import { CONTINUATION_CHURN_COUNT, LoopDetector } from "./loop-detector.ts";
+import { MAX_RUN_HISTORY, resolveDetectorConfig } from "../src/core/config.ts";
+import { RunHistoryDetector } from "../src/core/run-history.ts";
+import type { RunSummary } from "../src/core/run-summary.ts";
+
+const CONTINUATION_CHURN_COUNT = 4;
+
+function detectorWith(options: Parameters<typeof resolveDetectorConfig>[0] = {}) {
+  return new RunHistoryDetector(resolveDetectorConfig(options));
+}
 
 function episode(
   hash: string,
-  options: Partial<Omit<EpisodeDigest, "exactOutcomeHash">> = {},
-): EpisodeDigest {
+  options: Partial<Omit<RunSummary, "exactOutcomeHash">> = {},
+): RunSummary {
   return {
     actionFeatures: [1, 2, 3, 4],
     continuationPrompt: false,
@@ -20,36 +27,36 @@ function episode(
   };
 }
 
-describe("LoopDetector", () => {
+describe("RunHistoryDetector", () => {
   it("detects exact cycles of length one through four after three repetitions", () => {
     for (let cycleLength = 1; cycleLength <= 4; cycleLength += 1) {
-      const detector = new LoopDetector();
+      const detector = detectorWith();
       let decision = null;
       for (let repetition = 0; repetition < 3; repetition += 1) {
         for (let index = 0; index < cycleLength; index += 1) {
           decision = detector.observe(episode(`cycle-${String(index)}`));
         }
       }
-      expect(decision).toEqual({ cycleLength, kind: "exact_cycle", repetitions: 3 });
+      expect(decision).toEqual({ cycleLength, kind: "outcome_cycle", repeats: 3 });
     }
   });
 
   it("does not call a changing sequence an exact cycle", () => {
-    const detector = new LoopDetector();
+    const detector = detectorWith();
     for (let index = 0; index < 7; index += 1) {
       expect(detector.observe(episode(`unique-${String(index)}`))).toBeNull();
     }
   });
 
   it("does not compare truncated outcomes as exact cycles", () => {
-    const detector = new LoopDetector();
+    const detector = detectorWith();
     for (let index = 0; index < 3; index += 1) {
       expect(detector.observe(episode("same", { truncated: true }))).toBeNull();
     }
   });
 
   it("detects the same normalized terminal error three times", () => {
-    const detector = new LoopDetector();
+    const detector = detectorWith();
     let decision = null;
     for (let index = 0; index < 3; index += 1) {
       decision = detector.observe(
@@ -59,11 +66,11 @@ describe("LoopDetector", () => {
         }),
       );
     }
-    expect(decision).toEqual({ count: 3, kind: "repeated_error" });
+    expect(decision).toEqual({ kind: "repeated_error", repeats: 3 });
   });
 
   it("requires matching error fingerprints", () => {
-    const detector = new LoopDetector();
+    const detector = detectorWith();
     for (let index = 0; index < 3; index += 1) {
       expect(
         detector.observe(
@@ -77,7 +84,7 @@ describe("LoopDetector", () => {
   });
 
   it("detects continuation-led action churn", () => {
-    const detector = new LoopDetector();
+    const detector = detectorWith();
     let decision = null;
     for (let index = 0; index < CONTINUATION_CHURN_COUNT; index += 1) {
       decision = detector.observe(
@@ -88,14 +95,14 @@ describe("LoopDetector", () => {
         }),
       );
     }
-    expect(decision?.kind).toBe("continuation_churn");
-    if (decision?.kind === "continuation_churn") {
+    expect(decision?.kind).toBe("similar_actions");
+    if (decision?.kind === "similar_actions") {
       expect(decision.similarity).toBeGreaterThanOrEqual(0.85);
     }
   });
 
   it("does not trigger fuzzy matching for truncated episodes", () => {
-    const detector = new LoopDetector();
+    const detector = detectorWith();
     for (let index = 0; index < CONTINUATION_CHURN_COUNT; index += 1) {
       expect(
         detector.observe(
@@ -109,14 +116,14 @@ describe("LoopDetector", () => {
   });
 
   it("does not trigger fuzzy matching without continuation prompts", () => {
-    const detector = new LoopDetector();
+    const detector = detectorWith();
     for (let index = 0; index < CONTINUATION_CHURN_COUNT; index += 1) {
       expect(detector.observe(episode(`variant-${String(index)}`))).toBeNull();
     }
   });
 
   it("does not trigger continuation matching without tool actions", () => {
-    const detector = new LoopDetector();
+    const detector = detectorWith();
     for (let index = 0; index < CONTINUATION_CHURN_COUNT; index += 1) {
       expect(
         detector.observe(
@@ -131,12 +138,35 @@ describe("LoopDetector", () => {
   });
 
   it("allows long histories of distinct work while keeping bounded state", () => {
-    const detector = new LoopDetector();
+    const detector = detectorWith();
     for (let index = 0; index < 4_228; index += 1) {
       expect(detector.observe(episode(`long-${String(index)}`))).toBeNull();
     }
-    expect(detector.episodeCount).toBe(MAX_EPISODES);
+    expect(detector.runCount).toBe(MAX_RUN_HISTORY);
     detector.reset();
-    expect(detector.episodeCount).toBe(0);
+    expect(detector.runCount).toBe(0);
+  });
+
+  it("follows configured thresholds and lets a detector be turned off", () => {
+    const strict = detectorWith({ outcomeCycle: { maxLength: 1, repeats: 2 } });
+    expect(strict.observe(episode("same"))).toBeNull();
+    expect(strict.observe(episode("same"))).toEqual({
+      cycleLength: 1,
+      kind: "outcome_cycle",
+      repeats: 2,
+    });
+
+    const off = detectorWith({ outcomeCycle: false, repeatedError: false, similarActions: false });
+    for (let index = 0; index < 6; index += 1) {
+      expect(
+        off.observe(
+          episode("same", {
+            continuationPrompt: true,
+            terminalError: true,
+            terminalErrorFingerprint: "v1:same",
+          }),
+        ),
+      ).toBeNull();
+    }
   });
 });

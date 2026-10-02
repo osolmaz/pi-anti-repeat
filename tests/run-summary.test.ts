@@ -2,12 +2,12 @@ import { describe, expect, it } from "vitest";
 
 import {
   actionFeatureSimilarity,
-  EpisodeBuilder,
+  RunSummaryBuilder,
   MAX_ACTIONS_PER_EPISODE,
   MAX_FEATURES_PER_EPISODE,
   MAX_TURNS_PER_EPISODE,
   normalizeVolatileText,
-} from "./feature-encoder.ts";
+} from "../src/core/run-summary.ts";
 
 function toolTurn(command: string, result = "done", id = "call-1"): [unknown, unknown[]] {
   return [
@@ -39,7 +39,7 @@ function toolTurn(command: string, result = "done", id = "call-1"): [unknown, un
 }
 
 function digest(command: string, result = "done", id = "call-1") {
-  const builder = new EpisodeBuilder();
+  const builder = new RunSummaryBuilder();
   const [message, toolResults] = toolTurn(command, result, id);
   builder.accountTurn(message, toolResults);
   return builder.finish(true);
@@ -55,7 +55,7 @@ describe("normalizeVolatileText", () => {
   });
 });
 
-describe("EpisodeBuilder", () => {
+describe("RunSummaryBuilder", () => {
   it("keeps exact outcomes stable across volatile ids and timestamps", () => {
     const first = digest("python scan.py --position 60", "same", "call-1");
     const second = digest("python scan.py --position 60", "same", "call-999");
@@ -64,8 +64,8 @@ describe("EpisodeBuilder", () => {
   });
 
   it("preserves meaningful ids inside tool arguments", () => {
-    const first = new EpisodeBuilder();
-    const second = new EpisodeBuilder();
+    const first = new RunSummaryBuilder();
+    const second = new RunSummaryBuilder();
     first.accountTurn(
       {
         role: "assistant",
@@ -121,8 +121,8 @@ describe("EpisodeBuilder", () => {
   });
 
   it("normalizes repeated terminal errors", () => {
-    const first = new EpisodeBuilder();
-    const second = new EpisodeBuilder();
+    const first = new RunSummaryBuilder();
+    const second = new RunSummaryBuilder();
     first.accountAgentEnd([
       { role: "assistant", stopReason: "error", errorMessage: "request 123 failed" },
     ]);
@@ -136,7 +136,7 @@ describe("EpisodeBuilder", () => {
   });
 
   it("clears a transient terminal error after a successful retry", () => {
-    const builder = new EpisodeBuilder();
+    const builder = new RunSummaryBuilder();
     builder.accountAgentEnd([
       { role: "assistant", stopReason: "error", errorMessage: "request 123 failed" },
     ]);
@@ -151,7 +151,7 @@ describe("EpisodeBuilder", () => {
   });
 
   it("clears an error turn when a later retry turn succeeds", () => {
-    const builder = new EpisodeBuilder();
+    const builder = new RunSummaryBuilder();
     builder.accountTurn(
       { role: "assistant", stopReason: "error", errorMessage: "request 123 failed", content: [] },
       [],
@@ -165,8 +165,8 @@ describe("EpisodeBuilder", () => {
   });
 
   it("preserves meaningful error status codes", () => {
-    const first = new EpisodeBuilder();
-    const second = new EpisodeBuilder();
+    const first = new RunSummaryBuilder();
+    const second = new RunSummaryBuilder();
     first.accountAgentEnd([
       { role: "assistant", stopReason: "error", errorMessage: "HTTP status 400" },
     ]);
@@ -180,9 +180,9 @@ describe("EpisodeBuilder", () => {
   });
 });
 
-describe("EpisodeBuilder bounds", () => {
+describe("RunSummaryBuilder bounds", () => {
   it("bounds turns, tool calls, and action features", () => {
-    const builder = new EpisodeBuilder();
+    const builder = new RunSummaryBuilder();
     for (let index = 0; index < MAX_TURNS_PER_EPISODE + 5; index += 1) {
       const content = Array.from({ length: MAX_ACTIONS_PER_EPISODE + 3 }, (_, action) => ({
         type: "toolCall",
@@ -206,7 +206,7 @@ describe("EpisodeBuilder bounds", () => {
   });
 
   it("marks bounded message content arrays as truncated", () => {
-    const builder = new EpisodeBuilder();
+    const builder = new RunSummaryBuilder();
     builder.accountTurn(
       {
         role: "assistant",
@@ -221,7 +221,7 @@ describe("EpisodeBuilder bounds", () => {
   });
 
   it("does not fingerprint oversized terminal errors as repeatable", () => {
-    const builder = new EpisodeBuilder();
+    const builder = new RunSummaryBuilder();
     builder.accountAgentEnd([
       {
         role: "assistant",
@@ -236,7 +236,7 @@ describe("EpisodeBuilder bounds", () => {
   });
 
   it("handles malformed external values without throwing", () => {
-    const builder = new EpisodeBuilder();
+    const builder = new RunSummaryBuilder();
     builder.accountTurn(
       {
         role: "assistant",
@@ -260,9 +260,9 @@ describe("actionFeatureSimilarity", () => {
   });
 });
 
-describe("EpisodeBuilder argument canonicalization", () => {
+describe("RunSummaryBuilder argument canonicalization", () => {
   function argumentDigest(args: unknown) {
-    const builder = new EpisodeBuilder();
+    const builder = new RunSummaryBuilder();
     builder.accountTurn(
       {
         role: "assistant",
@@ -305,7 +305,7 @@ describe("EpisodeBuilder argument canonicalization", () => {
   });
 
   it("ignores turns that are not assistant tool calls", () => {
-    const builder = new EpisodeBuilder();
+    const builder = new RunSummaryBuilder();
     builder.accountTurn(null, []);
     builder.accountTurn({ role: "user", content: [] }, []);
 

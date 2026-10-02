@@ -1,35 +1,28 @@
 import { describe, expect, it } from "vitest";
 
-import { decisionLabel, interventionContent } from "./intervention-message.ts";
-import type { LoopDecision } from "./loop-detector.ts";
+import type { Detection } from "../src/core/detection.ts";
+import { correctionText, detectionLabel } from "../src/message.ts";
 
-const decisions: LoopDecision[] = [
-  { cycleLength: 2, kind: "exact_cycle", repetitions: 3 },
-  { count: 3, kind: "repeated_error" },
-  { count: 4, kind: "continuation_churn", similarity: 0.912 },
-  {
-    kind: "thinking_repetition",
-    matchedWindows: 3,
-    occurrences: 3,
-    tokensObserved: 9_234,
-    windowTokens: 96,
-  },
-  { kind: "manual_nudge" },
+const detections: Detection[] = [
+  { kind: "reasoning_repeat", matchedWindows: 3, repeats: 3, windowWords: 96, wordsObserved: 887 },
+  { cycleLength: 2, kind: "outcome_cycle", repeats: 3 },
+  { kind: "repeated_error", repeats: 3 },
+  { kind: "similar_actions", runs: 4, similarity: 0.912 },
 ];
 
-describe("interventionContent", () => {
-  it.each(decisions)("produces bounded actionable content for $kind", (decision) => {
-    const content = interventionContent(decision);
-    expect(content).toContain("Stop the current approach.");
-    expect(content).toContain("Choose one materially different next action.");
-    expect(content).toContain("Evidence:");
-    expect(content.length).toBeLessThan(1_000);
-    expect(decisionLabel(decision).length).toBeGreaterThan(0);
+describe("correctionText", () => {
+  it.each(detections)("gives short actionable evidence for $kind", (detection) => {
+    const text = correctionText(detection);
+    expect(text).toContain("Stop the current approach.");
+    expect(text).toContain("Choose one materially different next action.");
+    expect(text).toContain("Evidence:");
+    expect(text.length).toBeLessThan(1_000);
+    expect(detectionLabel(detection).length).toBeGreaterThan(0);
   });
 
-  it("reports rounded action similarity", () => {
-    expect(
-      interventionContent({ count: 4, kind: "continuation_churn", similarity: 0.912 }),
-    ).toContain("91% action similarity");
+  it("rounds action similarity to a percentage", () => {
+    expect(correctionText({ kind: "similar_actions", runs: 4, similarity: 0.912 })).toContain(
+      "91%",
+    );
   });
 });

@@ -1,39 +1,29 @@
-import type { LoopDecision } from "./loop-detector.ts";
+import type { Detection } from "./core/detection.ts";
 
-export const LOOP_GUARD_MESSAGE_TYPE = "pi-loop-guard";
-export const LOOP_GUARD_EVENT = "pi-loop-guard";
-
-export type LoopGuardEvent = {
-  action: "nudge" | "trip";
-  decision: LoopDecision;
-  version: 1;
-};
-
-function evidence(decision: LoopDecision): string {
-  switch (decision.kind) {
-    case "exact_cycle":
-      return `The same ${String(decision.cycleLength)}-run outcome cycle repeated ${String(decision.repetitions)} times.`;
+function evidence(detection: Detection): string {
+  switch (detection.kind) {
+    case "reasoning_repeat":
+      return `${String(detection.matchedWindows)} separate ${String(detection.windowWords)}-word passages of your reasoning each appeared ${String(detection.repeats)} times in one response.`;
+    case "outcome_cycle":
+      return `The same ${String(detection.cycleLength)}-run cycle of outcomes repeated ${String(detection.repeats)} times.`;
     case "repeated_error":
-      return `The same terminal error occurred ${String(decision.count)} times.`;
-    case "continuation_churn":
-      return `${String(decision.count)} continuation-led runs had ${String(Math.round(decision.similarity * 100))}% action similarity.`;
-    case "thinking_repetition":
-      return `${String(decision.matchedWindows)} separate ${String(decision.windowTokens)}-token reasoning windows each appeared ${String(decision.occurrences)} times within one response.`;
-    case "manual_nudge":
-      return "The user requested an immediate loop review.";
+      return `The same error ended ${String(detection.repeats)} runs in a row.`;
+    case "similar_actions":
+      return `${String(detection.runs)} runs after a "continue" prompt repeated ${String(Math.round(detection.similarity * 100))}% of the same actions.`;
   }
 }
 
-export function interventionContent(decision: LoopDecision): string {
+/** The default corrective message sent to the model. */
+export function correctionText(detection: Detection): string {
   return [
-    "Loop Guard detected repeated work.",
+    "Anti-Repeat detected repeated work.",
     "",
-    `Evidence: ${evidence(decision)}`,
+    `Evidence: ${evidence(detection)}`,
     "",
-    "Stop the current approach. Do not rerun or slightly vary the same experiment.",
+    "Stop the current approach. Do not rerun or slightly vary the same attempt.",
     "Before using more tools:",
-    "1. Restate the objective and verified facts.",
-    "2. Identify repeated actions and claims that were later invalidated.",
+    "1. Restate the objective and the facts you have verified.",
+    "2. Name the actions you repeated and the claims that turned out wrong.",
     "3. Decide whether the current path is blocked.",
     "4. Choose one materially different next action.",
     "",
@@ -41,17 +31,16 @@ export function interventionContent(decision: LoopDecision): string {
   ].join("\n");
 }
 
-export function decisionLabel(decision: LoopDecision): string {
-  switch (decision.kind) {
-    case "exact_cycle":
-      return `repeated ${String(decision.cycleLength)}-run cycle`;
+/** A short description for notifications, such as "repeated reasoning". */
+export function detectionLabel(detection: Detection): string {
+  switch (detection.kind) {
+    case "reasoning_repeat":
+      return "repeated reasoning";
+    case "outcome_cycle":
+      return `a repeated ${String(detection.cycleLength)}-run cycle`;
     case "repeated_error":
-      return "repeated terminal error";
-    case "continuation_churn":
-      return "repeated continuation work";
-    case "thinking_repetition":
-      return "repeated streamed reasoning";
-    case "manual_nudge":
-      return "manual review";
+      return "a repeated error";
+    case "similar_actions":
+      return "repeated actions";
   }
 }

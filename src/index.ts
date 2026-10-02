@@ -1,25 +1,35 @@
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionFactory } from "@earendil-works/pi-coding-agent";
 
-import { LoopGuardController } from "./loop-guard-controller.ts";
+import { AntiRepeatController, type ControllerContext } from "./controller.ts";
+import { resolveOptions, type AntiRepeatOptions } from "./options.ts";
+import { ANTI_REPEAT_CONTROL_CHANNEL, parseControl } from "./protocol.ts";
 
-const COMMANDS = ["on", "off", "status", "reset", "nudge"] as const;
+export type { AntiRepeatState } from "./controller.ts";
+export type { Detection, DetectionKind, DetectorOptions } from "./core/index.ts";
+export { correctionText, detectionLabel } from "./message.ts";
+export {
+  defaultPolicy,
+  type AntiRepeatAction,
+  type AntiRepeatOptions,
+  type AntiRepeatPolicy,
+  type PolicyInput,
+} from "./options.ts";
+export * from "./protocol.ts";
 
-type LoopGuardCommandContext = Parameters<LoopGuardController["enable"]>[0] & {
-  waitForIdle(): Promise<void>;
-};
+const SUBCOMMANDS = ["on", "off", "status", "reset"] as const;
 
-export async function handleLoopGuardCommand(
+export function runCommand(
   args: string,
-  controller: LoopGuardController,
-  ctx: LoopGuardCommandContext,
-): Promise<void> {
-  const command = args.trim().toLowerCase();
-  switch (command) {
+  controller: AntiRepeatController,
+  ctx: ControllerContext,
+  command: string,
+): void {
+  switch (args.trim().toLowerCase()) {
     case "on":
-      controller.enable(ctx);
+      controller.setEnabled(true, ctx);
       return;
     case "off":
-      controller.disable(ctx);
+      controller.setEnabled(false, ctx);
       return;
     case "status":
       ctx.ui.notify(controller.statusText, "info");
@@ -27,63 +37,78 @@ export async function handleLoopGuardCommand(
     case "reset":
       controller.reset(ctx);
       return;
-    case "nudge":
-      await ctx.waitForIdle();
-      controller.manualNudge(ctx);
-      return;
     default:
-      ctx.ui.notify("Usage: /loop-guard on|off|status|reset|nudge", "warning");
+      ctx.ui.notify(`Usage: /${command} on|off|status|reset`, "warning");
   }
 }
 
-function registerCommand(pi: ExtensionAPI, controller: LoopGuardController): void {
-  pi.registerCommand("loop-guard", {
-    description: "Enable, inspect, reset, or disable bounded loop detection",
+function registerCommand(
+  pi: ExtensionAPI,
+  controller: AntiRepeatController,
+  command: string,
+): void {
+  pi.registerCommand(command, {
+    description: "Turn repeat detection on or off, show its status, or start a new epoch",
     getArgumentCompletions: (prefix) => {
-      const matches = COMMANDS.filter((command) => command.startsWith(prefix));
-      return matches.length === 0
-        ? null
-        : matches.map((command) => ({ label: command, value: command }));
+      const matches = SUBCOMMANDS.filter((name) => name.startsWith(prefix));
+      return matches.length === 0 ? null : matches.map((name) => ({ label: name, value: name }));
     },
-    handler: (args, ctx) => handleLoopGuardCommand(args, controller, ctx),
+    handler: (args, ctx) => {
+      runCommand(args, controller, ctx, command);
+      return Promise.resolve();
+    },
   });
 }
 
-function registerLifecycle(pi: ExtensionAPI, controller: LoopGuardController): void {
-  pi.on("session_start", (_event, ctx) => {
-    controller.sessionStart(ctx);
-  });
-  pi.on("input", (event, ctx) => {
-    controller.input(event, ctx);
-  });
-  pi.on("agent_start", () => {
-    controller.agentStart();
-  });
-  pi.on("message_start", (event) => {
-    controller.messageStart(event);
-  });
-  pi.on("message_update", (event, ctx) => {
-    controller.messageUpdate(event, ctx);
-  });
-  pi.on("turn_start", () => {
-    controller.turnStart();
-  });
-  pi.on("turn_end", (event) => {
-    controller.turnEnd(event);
-  });
-  pi.on("agent_end", (event) => {
-    controller.agentEnd(event);
-  });
-  pi.on("agent_settled", (_event, ctx) => {
-    controller.agentSettled(ctx);
-  });
-  pi.on("session_shutdown", (_event, ctx) => {
-    controller.sessionShutdown(ctx);
-  });
+/**
+ * Creates the Anti-Repeat extension with the given options. Invalid options throw here, when the
+ * extension is created, instead of during a session.
+ */
+export function createAntiRepeat(options: AntiRepeatOptions = {}): ExtensionFactory {
+  const resolved = resolveOptions(options);
+  return (pi: ExtensionAPI) => {
+    // The stream listener is the only per-chunk work, so it is attached only while detecting.
+    const subscribeStream = () =>
+      pi.on("message_update", (event, ctx) => {
+        controller.messageUpdate(event, ctx);
+      });
+    const controller = new AntiRepeatController(resolved, pi, subscribeStream);
+
+    if (resolved.command !== false) registerCommand(pi, controller, resolved.command);
+    pi.events.on(ANTI_REPEAT_CONTROL_CHANNEL, (data) => {
+      const message = parseControl(data);
+      if (message !== null) controller.control(message);
+    });
+    pi.on("session_start", (_event, ctx) => {
+      controller.sessionStart(ctx);
+    });
+    pi.on("session_shutdown", (_event, ctx) => {
+      controller.sessionShutdown(ctx);
+    });
+    pi.on("input", (event, ctx) => {
+      controller.input(event, ctx);
+    });
+    pi.on("agent_start", () => {
+      controller.runStart();
+    });
+    pi.on("turn_start", () => {
+      controller.turnStart();
+    });
+    pi.on("message_start", (event) => {
+      controller.messageStart(event.message);
+    });
+    pi.on("turn_end", (event) => {
+      controller.turnEnd(event.message, event.toolResults);
+    });
+    pi.on("agent_end", (event) => {
+      controller.agentEnd(event.messages);
+    });
+    pi.on("agent_before_settle", (_event, ctx) => controller.beforeSettle(ctx));
+    pi.on("agent_settled", (_event, ctx) => {
+      controller.settled(ctx);
+    });
+  };
 }
 
-export default function loopGuardExtension(pi: ExtensionAPI): void {
-  const controller = new LoopGuardController(pi);
-  registerCommand(pi, controller);
-  registerLifecycle(pi, controller);
-}
+/** Anti-Repeat with default options. */
+export default createAntiRepeat();

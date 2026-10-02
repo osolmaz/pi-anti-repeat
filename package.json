@@ -1,10 +1,11 @@
 {
-  "name": "pi-loop-guard",
+  "name": "pi-anti-repeat",
   "version": "0.1.0",
-  "description": "Opt-in detection and interruption of repeated work for the Pi coding agent",
+  "description": "Detects and stops repeated work in the Pi coding agent, including loops inside streamed thinking",
   "keywords": [
     "pi-package",
     "pi-extension",
+    "anti-repeat",
     "loop-detection"
   ],
   "license": "MIT",
@@ -12,28 +13,28 @@
   "type": "module",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/osolmaz/pi-loop-guard.git"
+    "url": "git+https://github.com/osolmaz/pi-anti-repeat.git"
   },
   "bugs": {
-    "url": "https://github.com/osolmaz/pi-loop-guard/issues"
+    "url": "https://github.com/osolmaz/pi-anti-repeat/issues"
   },
-  "homepage": "https://github.com/osolmaz/pi-loop-guard#readme",
+  "homepage": "https://github.com/osolmaz/pi-anti-repeat#readme",
   "files": [
-    "index.ts",
-    "feature-encoder.ts",
-    "intervention-message.ts",
-    "loop-detector.ts",
-    "loop-guard-controller.ts",
-    "thinking-stream-detector.ts",
+    "src",
     "README.md",
     "LICENSE"
   ],
   "engines": {
     "node": ">=22.19.0"
   },
+  "exports": {
+    ".": "./src/index.ts",
+    "./core": "./src/core/index.ts",
+    "./protocol": "./src/protocol.ts"
+  },
   "pi": {
     "extensions": [
-      "./index.ts"
+      "./src/index.ts"
     ]
   },
   "scripts": {
@@ -45,12 +46,15 @@
     "dry": "slophammer-ts dry .",
     "mutate": "stryker run stryker.config.mjs",
     "slophammer": "slophammer-ts check .",
-    "check": "npm run format && npm run lint && npm run typecheck && npm run test && npm run coverage && npm run dry && npm run slophammer"
+    "check": "npm run format && npm run lint && npm run typecheck && npm run test && npm run coverage && npm run dry && npm run slophammer",
+    "replay": "node --experimental-strip-types --no-warnings scripts/replay.ts",
+    "smoke": "node --experimental-strip-types --no-warnings scripts/smoke.ts"
   },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*"
   },
   "devDependencies": {
+    "@earendil-works/pi-ai": "1.0.0",
     "@earendil-works/pi-coding-agent": "1.0.0",
     "@eslint/js": "10.0.1",
     "@stryker-mutator/core": "10.0.0",

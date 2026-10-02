@@ -8,16 +8,22 @@ typescript:
     paths:
       - .
     exclude:
-      - "**/*.test.ts"
+      - "tests/**"
+      - "scripts/**"
     copied_blocks:
       enabled: true
       min_tokens: 100
   mutation:
     targets:
-      - feature-encoder.ts
-      - intervention-message.ts
-      - loop-detector.ts
-      - loop-guard-controller.ts
+      - src/core/config.ts
+      - src/core/continuation.ts
+      - src/core/reasoning.ts
+      - src/core/run-history.ts
+      - src/core/run-summary.ts
+      - src/controller.ts
+      - src/message.ts
+      - src/options.ts
+      - src/protocol.ts
   dependency_boundaries:
     - from: .
       allow: []

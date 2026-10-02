@@ -46,7 +46,7 @@ export default tseslint.config(
     },
   },
   {
-    files: ["*.test.ts"],
+    files: ["tests/**/*.ts", "scripts/**/*.ts"],
     rules: {
       "max-lines-per-function": ["error", { max: 180, skipBlankLines: true, skipComments: true }],
     },

@@ -1,103 +1,102 @@
-import { createEventBus, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { createEventBus } from "@earendil-works/pi-coding-agent";
+import { describe, expect, it, vi } from "vitest";
 
-import { LOOP_GUARD_EVENT, LOOP_GUARD_MESSAGE_TYPE } from "./intervention-message.ts";
-import { isContinuationPrompt, LoopGuardController } from "./loop-guard-controller.ts";
+import { AntiRepeatController, type BoundaryResult } from "../src/controller.ts";
+import { resolveOptions, type AntiRepeatOptions, type PolicyInput } from "../src/options.ts";
+import {
+  ANTI_REPEAT_CONTROL_CHANNEL,
+  ANTI_REPEAT_EVENT_CHANNEL,
+  ANTI_REPEAT_MESSAGE_TYPE,
+  type AntiRepeatControlAction,
+  type AntiRepeatEvent,
+} from "../src/protocol.ts";
 
-type SentMessage = {
-  message: {
-    content: string;
-    customType: string;
-    details?: unknown;
-    display: boolean;
-  };
-  options:
-    | {
-        deliverAs?: "followUp" | "nextTurn" | "steer";
-        triggerTurn?: boolean;
-      }
-    | undefined;
-};
+type Sent = { message: { content: unknown; customType: string }; options: unknown };
 
-function createHarness(options: { idle?: boolean; pending?: boolean; sendFails?: boolean } = {}) {
-  const sent: SentMessage[] = [];
-  const emitted: unknown[] = [];
+function createHarness(
+  options: AntiRepeatOptions = {},
+  context: { idle?: boolean; pending?: boolean; sendFails?: boolean } = {},
+) {
   const events = createEventBus();
-  events.on(LOOP_GUARD_EVENT, (event) => emitted.push(event));
-  const runtime: Pick<ExtensionAPI, "events" | "sendMessage"> = {
+  const emitted: AntiRepeatEvent[] = [];
+  events.on(ANTI_REPEAT_EVENT_CHANNEL, (event) => emitted.push(event as AntiRepeatEvent));
+  const sent: Sent[] = [];
+  const runtime = {
     events,
-    sendMessage(message, messageOptions) {
-      if (options.sendFails === true) throw new Error("delivery failed");
-      sent.push({
-        message: {
-          content:
-            typeof message.content === "string" ? message.content : JSON.stringify(message.content),
-          customType: message.customType,
-          details: message.details,
-          display: message.display,
-        },
-        options: messageOptions,
-      });
+    sendMessage: (message: Sent["message"], sendOptions?: unknown) => {
+      if (context.sendFails === true) throw new Error("delivery failed");
+      sent.push({ message, options: sendOptions });
     },
   };
-  const abort = vi.fn();
-  const notify = vi.fn();
-  const setStatus = vi.fn();
-  const ctx = {
-    abort,
-    hasPendingMessages: () => options.pending ?? false,
-    isIdle: () => options.idle ?? true,
-    ui: { notify, setStatus },
+  let subscriptions = 0;
+  let active = 0;
+  const subscribe = () => {
+    subscriptions += 1;
+    active += 1;
+    return () => {
+      active -= 1;
+    };
   };
+  const ctx = {
+    abort: vi.fn(),
+    hasPendingMessages: () => context.pending ?? false,
+    isIdle: () => context.idle ?? true,
+    ui: { notify: vi.fn(), setStatus: vi.fn() },
+  };
+  const controller = new AntiRepeatController(resolveOptions(options), runtime, subscribe);
   return {
-    abort,
-    controller: new LoopGuardController(runtime),
     ctx,
+    controller,
     emitted,
-    notify,
+    events,
     sent,
-    setStatus,
+    get activeSubscriptions() {
+      return active;
+    },
+    get subscriptions() {
+      return subscriptions;
+    },
   };
 }
 
-function assistantTurn(command: string, result: string) {
+type Harness = ReturnType<typeof createHarness>;
+
+function toolTurn(command: string, result: string) {
+  const id = `call-${command}`;
   return {
     message: {
+      content: [{ arguments: { cmd: command }, id, name: "exec_command", type: "toolCall" }],
       role: "assistant",
       stopReason: "toolUse",
-      content: [
-        {
-          type: "toolCall",
-          id: `call-${command}`,
-          name: "exec_command",
-          arguments: { cmd: command },
-        },
-      ],
     },
     toolResults: [
       {
-        role: "toolResult",
-        toolCallId: `call-${command}`,
-        toolName: "exec_command",
+        content: [{ text: result, type: "text" }],
         isError: false,
-        content: [{ type: "text", text: result }],
+        role: "toolResult",
+        toolCallId: id,
+        toolName: "exec_command",
       },
     ],
   };
 }
 
-function settledEpisode(
-  harness: ReturnType<typeof createHarness>,
+/** Runs one complete agent run and returns what `agent_before_settle` returned. */
+function run(
+  harness: Harness,
   command: string,
-  result: string,
+  result = "same",
   prompt = "continue",
-): void {
+): BoundaryResult | undefined {
   harness.controller.input({ source: "interactive", text: prompt }, harness.ctx);
-  harness.controller.agentStart();
-  const turn = assistantTurn(command, result);
-  harness.controller.turnEnd(turn);
-  harness.controller.agentEnd({ messages: [turn.message, ...turn.toolResults] });
-  harness.controller.agentSettled(harness.ctx);
+  harness.controller.runStart();
+  harness.controller.turnStart();
+  const turn = toolTurn(command, result);
+  harness.controller.turnEnd(turn.message, turn.toolResults);
+  harness.controller.agentEnd([turn.message, ...turn.toolResults]);
+  const boundary = harness.controller.beforeSettle(harness.ctx);
+  harness.controller.settled(harness.ctx);
+  return boundary;
 }
 
 function repeatedThinking(prefix: string): string {
@@ -105,17 +104,13 @@ function repeatedThinking(prefix: string): string {
   return `${passage} ${passage} ${passage}`;
 }
 
-function streamThinking(
-  harness: ReturnType<typeof createHarness>,
-  thinking: string,
-  chunkSize = thinking.length,
-): void {
-  harness.controller.messageStart({ message: { role: "assistant" } });
-  for (let offset = 0; offset < thinking.length; offset += chunkSize) {
+function stream(harness: Harness, thinking: string, chunk = 64): void {
+  harness.controller.messageStart({ role: "assistant" });
+  for (let offset = 0; offset < thinking.length; offset += chunk) {
     harness.controller.messageUpdate(
       {
         assistantMessageEvent: {
-          delta: thinking.slice(offset, offset + chunkSize),
+          delta: thinking.slice(offset, offset + chunk),
           type: "thinking_delta",
         },
       },
@@ -128,309 +123,387 @@ function streamThinking(
   );
 }
 
-describe("isContinuationPrompt", () => {
-  it.each([
-    "continue",
-    "Continue please",
-    "go on",
-    "keep going",
-    "you decide",
-    "you choose",
-    "do it now",
-    "continue, you choose",
-    "please continue and you decide now",
-    "go ahead, then proceed",
-  ])("classifies %s as continuation", (prompt) => {
-    expect(isContinuationPrompt(prompt)).toBe(true);
+function started(options: AntiRepeatOptions = {}, context = {}): Harness {
+  const harness = createHarness(options, context);
+  harness.controller.sessionStart(harness.ctx);
+  return harness;
+}
+
+function control(harness: Harness, action: AntiRepeatControlAction): void {
+  harness.controller.control({ action, source: "test", version: 1 });
+}
+
+describe("AntiRepeatController defaults", () => {
+  it("watches from the start of a session and listens to the stream once", () => {
+    const harness = started();
+    expect(harness.controller.state).toBe("watching");
+    expect(harness.activeSubscriptions).toBe(1);
+    expect(harness.ctx.ui.setStatus).toHaveBeenLastCalledWith(
+      "anti-repeat",
+      "anti-repeat: watching",
+    );
+
+    harness.controller.reset(harness.ctx);
+    expect(harness.subscriptions).toBe(1);
   });
 
-  it.each([
-    "continue with a proof",
-    "continue and",
-    "continue, choose problem 488",
-    "you choose the next test",
-    "check the tests",
-    "use a different method",
-    "",
-  ])("classifies %s as substantive", (prompt) => {
-    expect(isContinuationPrompt(prompt)).toBe(false);
+  it("does nothing and does not listen when started off", () => {
+    const harness = started({ enabled: false });
+    for (let index = 0; index < 6; index += 1)
+      expect(run(harness, "python scan.py")).toBeUndefined();
+    stream(harness, repeatedThinking("off"));
+
+    expect(harness.controller.state).toBe("off");
+    expect(harness.activeSubscriptions).toBe(0);
+    expect(harness.emitted).toEqual([]);
+    expect(harness.ctx.abort).not.toHaveBeenCalled();
   });
 });
 
-describe("LoopGuardController", () => {
-  beforeEach(() => vi.restoreAllMocks());
+describe("AntiRepeatController run detections", () => {
+  it("returns one correction for Pi to commit and continue", () => {
+    const harness = started();
+    expect(run(harness, "python scan.py")).toBeUndefined();
+    expect(run(harness, "python scan.py")).toBeUndefined();
+    const boundary = run(harness, "python scan.py");
 
-  it("does nothing while disabled", () => {
-    const harness = createHarness();
-    for (let index = 0; index < 10; index += 1) {
-      settledEpisode(harness, "python scan.py", "same");
-    }
+    expect(boundary?.continue).toBe(true);
+    expect(boundary?.entries).toHaveLength(1);
+    expect(boundary?.entries[0]).toMatchObject({
+      customType: ANTI_REPEAT_MESSAGE_TYPE,
+      details: { detection: { kind: "outcome_cycle" }, version: 1 },
+      display: true,
+      type: "custom_message",
+    });
     expect(harness.sent).toEqual([]);
-    expect(harness.emitted).toEqual([]);
-    expect(harness.controller.state).toBe("off");
+    expect(harness.controller.state).toBe("corrected");
+    expect(harness.emitted.map((event) => event.type)).toEqual(["detected", "corrected"]);
   });
 
-  it("sends one visible follow-up after an exact settled-run cycle", () => {
-    const harness = createHarness();
-    harness.controller.enable(harness.ctx);
-    for (let index = 0; index < 3; index += 1) {
-      settledEpisode(harness, "python scan.py", "same");
-    }
+  it("stops instead of sending a second correction", () => {
+    const harness = started();
+    for (let index = 0; index < 3; index += 1) run(harness, "python scan.py");
+    let last: BoundaryResult | undefined;
+    for (let index = 0; index < 3; index += 1) last = run(harness, "python scan.py");
 
-    expect(harness.controller.state).toBe("nudged");
-    expect(harness.sent).toHaveLength(1);
-    expect(harness.sent[0]?.message.customType).toBe(LOOP_GUARD_MESSAGE_TYPE);
-    expect(harness.sent[0]?.message.display).toBe(true);
-    expect(harness.sent[0]?.options).toEqual({ deliverAs: "followUp", triggerTurn: true });
-    expect(harness.emitted).toMatchObject([
-      { action: "nudge", decision: { kind: "exact_cycle" }, version: 1 },
+    expect(last).toBeUndefined();
+    expect(harness.controller.state).toBe("stopped");
+    expect(harness.activeSubscriptions).toBe(0);
+    expect(harness.emitted.map((event) => event.type)).toEqual([
+      "detected",
+      "corrected",
+      "detected",
+      "stopped",
     ]);
   });
 
-  it("trips safely when the intervention cannot be delivered", () => {
-    const harness = createHarness({ sendFails: true });
-    harness.controller.enable(harness.ctx);
-    for (let index = 0; index < 3; index += 1) {
-      settledEpisode(harness, "python scan.py", "same");
-    }
-
-    expect(harness.controller.state).toBe("tripped");
-    expect(harness.sent).toEqual([]);
-    expect(harness.emitted).toMatchObject([{ action: "trip" }]);
+  it("keeps the epoch across continuation prompts and resets it on new instructions", () => {
+    const harness = started();
+    run(harness, "python scan.py");
+    run(harness, "python scan.py");
+    run(harness, "python scan.py", "same", "now try the second dataset");
+    expect(run(harness, "python scan.py")).toBeUndefined();
+    expect(run(harness, "python scan.py")?.continue).toBe(true);
   });
 
-  it("does not start a duplicate turn when another extension has pending work", () => {
-    const harness = createHarness({ pending: true });
-    harness.controller.enable(harness.ctx);
-    for (let index = 0; index < 3; index += 1) {
-      settledEpisode(harness, "python scan.py", "same");
+  it("catches similar actions after continuation prompts", () => {
+    const harness = started();
+    let last: BoundaryResult | undefined;
+    for (const position of [60, 70, 80, 90]) {
+      last = run(
+        harness,
+        `python3 subset_scan.py --position ${String(position)} --cap ${String(position * 1_000_000)}`,
+        `position ${String(position)} gave a different measurement`,
+      );
     }
+    expect(last?.entries[0]?.content).toContain('after a "continue" prompt');
+  });
+
+  it("ignores input from extensions for epochs", () => {
+    const harness = started();
+    run(harness, "python scan.py");
+    run(harness, "python scan.py");
+    harness.controller.input({ source: "extension", text: "a different instruction" }, harness.ctx);
+    expect(run(harness, "python scan.py")?.continue).toBe(true);
+  });
+
+  it("checks a run that was aborted by the user when it settles", () => {
+    const harness = started();
+    run(harness, "python scan.py");
+    run(harness, "python scan.py");
+    harness.controller.input({ source: "interactive", text: "continue" }, harness.ctx);
+    harness.controller.runStart();
+    const turn = toolTurn("python scan.py", "same");
+    harness.controller.turnEnd(turn.message, turn.toolResults);
+    harness.controller.agentEnd([turn.message, ...turn.toolResults]);
+    harness.controller.settled(harness.ctx);
+
+    expect(harness.sent).toHaveLength(1);
+    expect(harness.sent[0]?.options).toEqual({ deliverAs: "followUp", triggerTurn: true });
+  });
+});
+
+describe("AntiRepeatController streamed reasoning", () => {
+  it("cuts off repeating reasoning and sends one correction after settling", () => {
+    const harness = started();
+    harness.controller.runStart();
+    stream(harness, repeatedThinking("density"), 7);
+
+    expect(harness.ctx.abort).toHaveBeenCalledOnce();
+    expect(harness.sent).toEqual([]);
+    expect(harness.controller.beforeSettle(harness.ctx)).toBeUndefined();
+
+    harness.controller.settled(harness.ctx);
+    expect(harness.sent).toHaveLength(1);
+    expect(harness.sent[0]?.message.customType).toBe(ANTI_REPEAT_MESSAGE_TYPE);
+    expect(harness.sent[0]?.message.content).toEqual(
+      expect.stringContaining("passages of your reasoning"),
+    );
+    expect(harness.sent[0]?.options).toEqual({ deliverAs: "followUp", triggerTurn: true });
+    expect(harness.controller.state).toBe("corrected");
+  });
+
+  it("stops on a second repeat without another correction", () => {
+    const harness = started();
+    harness.controller.runStart();
+    stream(harness, repeatedThinking("first"), 31);
+    harness.controller.settled(harness.ctx);
+    harness.controller.runStart();
+    stream(harness, repeatedThinking("second"), 29);
+    harness.controller.settled(harness.ctx);
+
+    expect(harness.ctx.abort).toHaveBeenCalledTimes(2);
+    expect(harness.sent).toHaveLength(1);
+    expect(harness.controller.state).toBe("stopped");
+  });
+
+  it("does not start a turn when other work is queued", () => {
+    const harness = started({}, { pending: true });
+    harness.controller.runStart();
+    stream(harness, repeatedThinking("queued"));
+    harness.controller.settled(harness.ctx);
     expect(harness.sent[0]?.options).toEqual({ deliverAs: "followUp", triggerTurn: false });
   });
 
-  it("catches sanitized Bob-style continuation churn", () => {
-    const harness = createHarness();
-    harness.controller.enable(harness.ctx);
-    for (const position of [60, 70, 80, 90]) {
-      settledEpisode(
-        harness,
-        `python3 subset_scan.py --position ${String(position)} --cap ${String(position * 1_000_000)}`,
-        `position ${String(position)} produced a different measurement`,
-      );
-    }
+  it("stops safely when the correction cannot be sent", () => {
+    const harness = started({}, { sendFails: true });
+    harness.controller.runStart();
+    stream(harness, repeatedThinking("delivery"));
+    harness.controller.settled(harness.ctx);
 
-    expect(harness.sent).toHaveLength(1);
-    expect(harness.sent[0]?.message.content).toContain("continuation-led runs");
-  });
-
-  it("does not fuzzy-match materially directed experiments", () => {
-    const harness = createHarness();
-    harness.controller.enable(harness.ctx);
-    for (const prompt of [
-      "test position 60",
-      "now test a different algorithm",
-      "inspect the proof",
-      "run the formatter",
-    ]) {
-      settledEpisode(harness, "python scan.py --position 60", prompt, prompt);
-    }
     expect(harness.sent).toEqual([]);
+    expect(harness.controller.state).toBe("stopped");
+    expect(harness.emitted.map((event) => event.type)).toContain("stopped");
   });
 
-  it("retains settled history for compound continuation prompts", () => {
-    const harness = createHarness();
-    harness.controller.enable(harness.ctx);
-    for (let index = 0; index < 3; index += 1) {
-      settledEpisode(harness, "python scan.py", "same", "continue, you choose");
-    }
-
-    expect(harness.sent).toHaveLength(1);
-    expect(harness.emitted).toMatchObject([{ action: "nudge", decision: { kind: "exact_cycle" } }]);
-  });
-
-  it("trips instead of sending a second automatic message", () => {
-    const harness = createHarness();
-    harness.controller.enable(harness.ctx);
-    for (let round = 0; round < 2; round += 1) {
-      for (let index = 0; index < 3; index += 1) {
-        settledEpisode(harness, "python scan.py", "same");
-      }
-    }
-
-    expect(harness.controller.state).toBe("tripped");
-    expect(harness.sent).toHaveLength(1);
-    expect(harness.emitted).toMatchObject([{ action: "nudge" }, { action: "trip" }]);
-  });
-});
-
-describe("LoopGuardController streamed thinking", () => {
-  beforeEach(() => vi.restoreAllMocks());
-
-  it("aborts repeated thinking and delivers one correction only after settlement", () => {
-    const harness = createHarness();
-    harness.controller.enable(harness.ctx);
-    harness.controller.agentStart();
-
-    streamThinking(harness, repeatedThinking("density"), 7);
-
-    expect(harness.abort).toHaveBeenCalledOnce();
-    expect(harness.controller.state).toBe("nudged");
-    expect(harness.sent).toEqual([]);
-    expect(harness.emitted).toMatchObject([
-      { action: "nudge", decision: { kind: "thinking_repetition" }, version: 1 },
-    ]);
-
-    harness.controller.agentSettled(harness.ctx);
-
-    expect(harness.sent).toHaveLength(1);
-    expect(harness.sent[0]?.message.customType).toBe(LOOP_GUARD_MESSAGE_TYPE);
-    expect(harness.sent[0]?.message.content).toContain("reasoning windows");
-    expect(harness.sent[0]?.options).toEqual({
-      deliverAs: "followUp",
-      triggerTurn: true,
-    });
-  });
-
-  it("trips and aborts without a second correction on repeated streamed thinking", () => {
-    const harness = createHarness();
-    harness.controller.enable(harness.ctx);
-    harness.controller.agentStart();
-    streamThinking(harness, repeatedThinking("first"), 31);
-    harness.controller.agentSettled(harness.ctx);
-
-    harness.controller.agentStart();
-    streamThinking(harness, repeatedThinking("second"), 29);
-
-    expect(harness.abort).toHaveBeenCalledTimes(2);
-    expect(harness.controller.state).toBe("tripped");
-    expect(harness.sent).toHaveLength(1);
-    expect(harness.emitted).toMatchObject([{ action: "nudge" }, { action: "trip" }]);
-  });
-
-  it("trips safely if the delayed correction cannot be delivered", () => {
-    const harness = createHarness({ sendFails: true });
-    harness.controller.enable(harness.ctx);
-    harness.controller.agentStart();
-    streamThinking(harness, repeatedThinking("delivery"));
-
-    harness.controller.agentSettled(harness.ctx);
-
-    expect(harness.abort).toHaveBeenCalledOnce();
-    expect(harness.controller.state).toBe("tripped");
-    expect(harness.sent).toEqual([]);
-    expect(harness.emitted).toMatchObject([{ action: "nudge" }, { action: "trip" }]);
-  });
-
-  it("ignores repeated visible answer text", () => {
-    const harness = createHarness();
-    harness.controller.enable(harness.ctx);
-    harness.controller.agentStart();
-    harness.controller.messageStart({ message: { role: "assistant" } });
+  it("ignores repeated answer text", () => {
+    const harness = started();
+    harness.controller.messageStart({ role: "assistant" });
     harness.controller.messageUpdate(
-      {
-        assistantMessageEvent: {
-          delta: repeatedThinking("answer"),
-          type: "text_delta",
-        },
-      },
+      { assistantMessageEvent: { delta: repeatedThinking("answer"), type: "text_delta" } },
       harness.ctx,
     );
-
-    expect(harness.abort).not.toHaveBeenCalled();
-    expect(harness.controller.state).toBe("armed");
+    expect(harness.ctx.abort).not.toHaveBeenCalled();
   });
 
-  it("clears partial stream evidence after substantive direction", () => {
-    const harness = createHarness({ idle: false });
+  it("drops partial evidence when the user steers, and counts again from the next turn", () => {
+    const harness = started({}, { idle: false });
     const passage = Array.from({ length: 176 }, (_, index) => `partial${String(index)}`).join(" ");
-    harness.controller.enable(harness.ctx);
-    harness.controller.agentStart();
-    streamThinking(harness, `${passage} ${passage}`);
-
+    harness.controller.runStart();
+    stream(harness, `${passage} ${passage}`);
     harness.controller.input(
-      {
-        source: "interactive",
-        streamingBehavior: "steer",
-        text: "stop and prove a different lemma",
-      },
+      { source: "interactive", streamingBehavior: "steer", text: "prove a different lemma" },
       harness.ctx,
     );
-    streamThinking(harness, passage);
+    harness.controller.messageUpdate(
+      { assistantMessageEvent: { delta: ` ${passage}`, type: "thinking_delta" } },
+      harness.ctx,
+    );
+    expect(harness.ctx.abort).not.toHaveBeenCalled();
 
-    expect(harness.abort).not.toHaveBeenCalled();
-    expect(harness.controller.state).toBe("armed");
-    expect(harness.sent).toEqual([]);
+    harness.controller.turnStart();
+    stream(harness, repeatedThinking("next"));
+    expect(harness.ctx.abort).toHaveBeenCalledOnce();
   });
 
   it("drops a pending correction when the session shuts down", () => {
-    const harness = createHarness();
-    harness.controller.enable(harness.ctx);
-    harness.controller.agentStart();
-    streamThinking(harness, repeatedThinking("shutdown"));
-    expect(harness.abort).toHaveBeenCalledOnce();
-
+    const harness = started();
+    harness.controller.runStart();
+    stream(harness, repeatedThinking("shutdown"));
     harness.controller.sessionShutdown(harness.ctx);
-    harness.controller.agentSettled(harness.ctx);
+    harness.controller.settled(harness.ctx);
 
-    expect(harness.controller.state).toBe("off");
     expect(harness.sent).toEqual([]);
+    expect(harness.controller.state).toBe("off");
+    expect(harness.ctx.ui.setStatus).toHaveBeenLastCalledWith("anti-repeat", undefined);
   });
 });
 
-describe("LoopGuardController active runs", () => {
-  beforeEach(() => vi.restoreAllMocks());
+describe("AntiRepeatController options", () => {
+  it.each([
+    ["ignore", 0],
+    ["notify", 1],
+  ] as const)("only reports when the policy says %s", (action, notifications) => {
+    const harness = started({ policy: () => action });
+    for (let index = 0; index < 3; index += 1)
+      expect(run(harness, "python scan.py")).toBeUndefined();
 
-  it("allows active runs beyond the old turn checkpoint", () => {
-    const harness = createHarness({ idle: false });
-    harness.controller.enable(harness.ctx);
-    harness.controller.agentStart();
-    for (let index = 0; index < 48; index += 1) {
-      harness.controller.turnEnd(
-        assistantTurn(`python step-${String(index)}.py`, `result-${String(index)}`),
-      );
+    expect(harness.emitted.map((event) => event.type)).toEqual(["detected"]);
+    expect(harness.ctx.ui.notify).toHaveBeenCalledTimes(notifications);
+    expect(harness.controller.state).toBe("watching");
+  });
+
+  it("can stop at the first detection and passes the evidence to the policy", () => {
+    const policy = vi.fn(() => "stop" as const);
+    const harness = started({ policy });
+    harness.controller.runStart();
+    stream(harness, repeatedThinking("policy"));
+
+    const input = policy.mock.calls[0] as unknown as [PolicyInput] | undefined;
+    expect(input?.[0].activeResponse).toBe(true);
+    expect(input?.[0].corrections).toBe(0);
+    expect(input?.[0].detection.kind).toBe("reasoning_repeat");
+    expect(harness.ctx.abort).toHaveBeenCalledOnce();
+    expect(harness.controller.state).toBe("stopped");
+  });
+
+  it("falls back to notifying when the policy fails or returns nonsense", () => {
+    const failing = started({
+      policy: () => {
+        throw new Error("broken");
+      },
+    });
+    const nonsense = started({ policy: () => "explode" as unknown as "stop" });
+    for (const harness of [failing, nonsense]) {
+      for (let index = 0; index < 3; index += 1)
+        expect(run(harness, "python scan.py")).toBeUndefined();
+      expect(harness.controller.state).toBe("watching");
     }
-
-    expect(harness.sent).toEqual([]);
-    expect(harness.abort).not.toHaveBeenCalled();
-    expect(harness.controller.state).toBe("armed");
   });
 
-  it("starts a fresh armed epoch on substantive user direction", () => {
-    const harness = createHarness();
-    harness.controller.enable(harness.ctx);
-    harness.controller.manualNudge(harness.ctx);
-    expect(harness.controller.state).toBe("nudged");
+  it("uses a custom message, and the default when it fails or is empty", () => {
+    const custom = started({ message: () => "Try something else." });
+    const failing = started({
+      message: () => {
+        throw new Error("broken");
+      },
+    });
+    const empty = started({ message: () => "" });
+    const long = started({ message: () => "x".repeat(10_000) });
+    const results = [custom, failing, empty, long].map((harness) => {
+      run(harness, "python scan.py");
+      run(harness, "python scan.py");
+      return run(harness, "python scan.py")?.entries[0]?.content ?? "";
+    });
 
-    harness.controller.input(
-      { source: "interactive", text: "stop measuring and prove the lemma" },
-      harness.ctx,
-    );
-    expect(harness.controller.state).toBe("armed");
+    expect(results[0]).toBe("Try something else.");
+    expect(results[1]).toContain("Anti-Repeat detected repeated work.");
+    expect(results[2]).toContain("Anti-Repeat detected repeated work.");
+    expect(results[3]).toHaveLength(4_000);
   });
 
-  it("ignores extension-originated input for epoch resets", () => {
-    const harness = createHarness();
-    harness.controller.enable(harness.ctx);
-    harness.controller.manualNudge(harness.ctx);
-    harness.controller.input({ source: "extension", text: "a different instruction" }, harness.ctx);
-    expect(harness.controller.state).toBe("nudged");
+  it("treats a failing continuation check as a new instruction", () => {
+    const harness = started({
+      isContinuation: () => {
+        throw new Error("broken");
+      },
+    });
+    run(harness, "python scan.py");
+    run(harness, "python scan.py");
+    expect(run(harness, "python scan.py")).toBeUndefined();
   });
 
-  it("clears all behavior and UI status during shutdown", () => {
-    const harness = createHarness();
-    harness.controller.enable(harness.ctx);
-    harness.controller.sessionShutdown(harness.ctx);
-
-    expect(harness.controller.state).toBe("off");
-    expect(harness.setStatus).toHaveBeenLastCalledWith("loop-guard", undefined);
-  });
-
-  it("requires enablement before reset or manual nudge", () => {
-    const harness = createHarness();
+  it("can run without status or notifications", () => {
+    const harness = started({ notify: false, status: false });
+    harness.controller.runStart();
+    stream(harness, repeatedThinking("quiet"));
+    harness.controller.settled(harness.ctx);
     harness.controller.reset(harness.ctx);
-    harness.controller.manualNudge(harness.ctx);
 
-    expect(harness.sent).toEqual([]);
-    expect(harness.notify).toHaveBeenCalledTimes(2);
+    expect(harness.sent).toHaveLength(1);
+    expect(harness.ctx.ui.setStatus).not.toHaveBeenCalled();
+    expect(harness.ctx.ui.notify).not.toHaveBeenCalled();
+  });
+
+  it("keeps working when another extension's listener throws", () => {
+    const harness = started();
+    harness.events.on(ANTI_REPEAT_EVENT_CHANNEL, () => {
+      throw new Error("listener failed");
+    });
+    run(harness, "python scan.py");
+    run(harness, "python scan.py");
+    expect(run(harness, "python scan.py")?.continue).toBe(true);
+  });
+});
+
+describe("AntiRepeatController control", () => {
+  it("turns off, removes the listener, and turns on again", () => {
+    const harness = started();
+    harness.controller.setEnabled(false, harness.ctx);
+    expect(harness.controller.state).toBe("off");
+    expect(harness.activeSubscriptions).toBe(0);
+    harness.controller.reset(harness.ctx);
+    expect(harness.ctx.ui.notify).toHaveBeenLastCalledWith(
+      "Anti-Repeat is off. Turn it on first.",
+      "warning",
+    );
+
+    harness.controller.setEnabled(true, harness.ctx);
+    expect(harness.controller.state).toBe("watching");
+    expect(harness.activeSubscriptions).toBe(1);
+    expect(harness.emitted.map((event) => event.type)).toEqual(["disabled", "enabled"]);
+  });
+
+  it("pauses and resumes for another extension, discarding the paused run", () => {
+    const harness = started();
+    run(harness, "python scan.py");
+    run(harness, "python scan.py");
+    harness.controller.runStart();
+    control(harness, "pause");
+    expect(harness.controller.state).toBe("paused");
+    expect(harness.activeSubscriptions).toBe(0);
+    expect(harness.controller.beforeSettle(harness.ctx)).toBeUndefined();
+    harness.controller.settled(harness.ctx);
+
+    control(harness, "resume");
+    expect(harness.activeSubscriptions).toBe(1);
+    expect(run(harness, "python scan.py")?.continue).toBe(true);
+  });
+
+  it("does not count a run that another extension restarts on purpose", () => {
+    const harness = started();
+    run(harness, "python scan.py");
+    run(harness, "python scan.py");
+    control(harness, "ignore-next-run");
+    expect(run(harness, "python scan.py")).toBeUndefined();
+    expect(run(harness, "python scan.py")?.continue).toBe(true);
+  });
+
+  it("starts a new epoch on a reset message", () => {
+    const harness = started();
+    run(harness, "python scan.py");
+    run(harness, "python scan.py");
+    control(harness, "reset");
+    expect(run(harness, "python scan.py")).toBeUndefined();
+    expect(harness.emitted.map((event) => event.type)).toEqual(["reset"]);
+    expect(harness.emitted[0]?.epoch).toBeGreaterThan(1);
+  });
+
+  it("uses the documented control channel name", () => {
+    expect(ANTI_REPEAT_CONTROL_CHANNEL).toBe("anti-repeat:control");
+  });
+
+  it("reports its state in plain words", () => {
+    const harness = started();
+    expect(harness.controller.statusText).toContain("watching");
+    control(harness, "pause");
+    expect(harness.controller.statusText).toContain("paused");
+    control(harness, "resume");
+    for (let index = 0; index < 3; index += 1) run(harness, "python scan.py");
+    expect(harness.controller.statusText).toContain("sent one correction");
+    for (let index = 0; index < 3; index += 1) run(harness, "python scan.py");
+    expect(harness.controller.statusText).toContain("stopped");
+    harness.controller.setEnabled(false, harness.ctx);
+    expect(harness.controller.statusText).toBe("Anti-Repeat is off.");
   });
 });

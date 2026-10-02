@@ -1,42 +1,18 @@
-import { actionFeatureSimilarity, MAX_EPISODES, type EpisodeDigest } from "./feature-encoder.ts";
+import { MAX_RUN_HISTORY, type DetectorConfig } from "./config.ts";
+import type { Detection } from "./detection.ts";
+import { actionFeatureSimilarity, type RunSummary } from "./run-summary.ts";
 
-export const EXACT_CYCLE_REPETITIONS = 3;
-export const MAX_EXACT_CYCLE_LENGTH = 4;
-export const REPEATED_ERROR_COUNT = 3;
-export const CONTINUATION_CHURN_COUNT = 4;
-export const CONTINUATION_SIMILARITY_THRESHOLD = 0.85;
+type RunRules = Pick<DetectorConfig, "outcomeCycle" | "repeatedError" | "similarActions">;
 
-export type LoopDecision =
-  | {
-      cycleLength: number;
-      kind: "exact_cycle";
-      repetitions: number;
-    }
-  | {
-      count: number;
-      kind: "repeated_error";
-    }
-  | {
-      count: number;
-      kind: "continuation_churn";
-      similarity: number;
-    }
-  | {
-      kind: "thinking_repetition";
-      matchedWindows: number;
-      occurrences: number;
-      tokensObserved: number;
-      windowTokens: number;
-    }
-  | {
-      kind: "manual_nudge";
-    };
-
-function suffixRepeats(history: readonly EpisodeDigest[], cycleLength: number): boolean {
-  const required = cycleLength * EXACT_CYCLE_REPETITIONS;
+function suffixRepeats(
+  history: readonly RunSummary[],
+  cycleLength: number,
+  repeats: number,
+): boolean {
+  const required = cycleLength * repeats;
   if (history.length < required) return false;
   const start = history.length - required;
-  if (history.slice(start).some((episode) => episode.truncated)) return false;
+  if (history.slice(start).some((run) => run.truncated)) return false;
   for (let offset = cycleLength; offset < required; offset += 1) {
     const current = history[start + offset];
     const expected = history[start + (offset % cycleLength)];
@@ -45,94 +21,83 @@ function suffixRepeats(history: readonly EpisodeDigest[], cycleLength: number): 
   return true;
 }
 
-function exactCycleLength(history: readonly EpisodeDigest[]): number | undefined {
-  const maximum = Math.min(
-    MAX_EXACT_CYCLE_LENGTH,
-    Math.floor(history.length / EXACT_CYCLE_REPETITIONS),
-  );
+function outcomeCycle(history: readonly RunSummary[], rules: RunRules): Detection | null {
+  const config = rules.outcomeCycle;
+  if (config === false) return null;
+  const maximum = Math.min(config.maxLength, Math.floor(history.length / config.repeats));
   for (let cycleLength = 1; cycleLength <= maximum; cycleLength += 1) {
-    if (suffixRepeats(history, cycleLength)) return cycleLength;
-  }
-  return undefined;
-}
-
-function repeatedError(history: readonly EpisodeDigest[]): boolean {
-  const suffix = history.slice(-REPEATED_ERROR_COUNT);
-  if (suffix.length !== REPEATED_ERROR_COUNT) return false;
-  const fingerprint = suffix[0]?.terminalErrorFingerprint;
-  return (
-    fingerprint !== null &&
-    fingerprint !== undefined &&
-    suffix.every(
-      (episode) => episode.terminalError && episode.terminalErrorFingerprint === fingerprint,
-    )
-  );
-}
-
-function isContinuationWindow(episodes: readonly EpisodeDigest[]): boolean {
-  return (
-    episodes.length === CONTINUATION_CHURN_COUNT &&
-    episodes.every(
-      (episode) => episode.continuationPrompt && episode.toolCalls > 0 && !episode.truncated,
-    )
-  );
-}
-
-function adjacentSimilarities(episodes: readonly EpisodeDigest[]): number[] {
-  const similarities: number[] = [];
-  for (let index = 1; index < episodes.length; index += 1) {
-    similarities.push(
-      actionFeatureSimilarity(
-        episodes[index - 1]?.actionFeatures ?? [],
-        episodes[index]?.actionFeatures ?? [],
-      ),
-    );
-  }
-  return similarities;
-}
-
-function continuationSimilarity(history: readonly EpisodeDigest[]): number | undefined {
-  const suffix = history.slice(-CONTINUATION_CHURN_COUNT);
-  if (!isContinuationWindow(suffix)) return undefined;
-  const similarities = adjacentSimilarities(suffix);
-  if (similarities.some((value) => value < CONTINUATION_SIMILARITY_THRESHOLD)) return undefined;
-  return similarities.reduce((total, value) => total + value, 0) / similarities.length;
-}
-
-function detect(history: readonly EpisodeDigest[]): LoopDecision | null {
-  const cycleLength = exactCycleLength(history);
-  if (cycleLength !== undefined) {
-    return {
-      cycleLength,
-      kind: "exact_cycle",
-      repetitions: EXACT_CYCLE_REPETITIONS,
-    };
-  }
-  if (repeatedError(history)) {
-    return { count: REPEATED_ERROR_COUNT, kind: "repeated_error" };
-  }
-  const similarity = continuationSimilarity(history);
-  if (similarity !== undefined) {
-    return {
-      count: CONTINUATION_CHURN_COUNT,
-      kind: "continuation_churn",
-      similarity,
-    };
+    if (suffixRepeats(history, cycleLength, config.repeats)) {
+      return { cycleLength, kind: "outcome_cycle", repeats: config.repeats };
+    }
   }
   return null;
 }
 
-export class LoopDetector {
-  private readonly history: EpisodeDigest[] = [];
+function repeatedError(history: readonly RunSummary[], rules: RunRules): Detection | null {
+  const config = rules.repeatedError;
+  if (config === false) return null;
+  const suffix = history.slice(-config.repeats);
+  if (suffix.length !== config.repeats) return null;
+  const fingerprint = suffix[0]?.terminalErrorFingerprint;
+  if (fingerprint === null || fingerprint === undefined) return null;
+  const same = suffix.every(
+    (run) => run.terminalError && run.terminalErrorFingerprint === fingerprint,
+  );
+  return same ? { kind: "repeated_error", repeats: config.repeats } : null;
+}
 
-  get episodeCount(): number {
+function isComparableContinuation(run: RunSummary): boolean {
+  return run.continuationPrompt && run.toolCalls > 0 && !run.truncated;
+}
+
+/** Mean similarity of adjacent runs, or null when any pair is below `minimum`. */
+function adjacentSimilarity(runs: readonly RunSummary[], minimum: number): number | null {
+  let total = 0;
+  for (let index = 1; index < runs.length; index += 1) {
+    const similarity = actionFeatureSimilarity(
+      runs[index - 1]?.actionFeatures ?? [],
+      runs[index]?.actionFeatures ?? [],
+    );
+    if (similarity < minimum) return null;
+    total += similarity;
+  }
+  return total / (runs.length - 1);
+}
+
+function similarActions(history: readonly RunSummary[], rules: RunRules): Detection | null {
+  const config = rules.similarActions;
+  if (config === false) return null;
+  const suffix = history.slice(-config.runs);
+  if (suffix.length !== config.runs || !suffix.every(isComparableContinuation)) return null;
+  const similarity = adjacentSimilarity(suffix, config.similarity);
+  return similarity === null ? null : { kind: "similar_actions", runs: config.runs, similarity };
+}
+
+/**
+ * Keeps summaries of recent runs and reports repeated outcomes, repeated errors, and runs that
+ * repeat almost the same actions after a short "continue" prompt. A run count alone never
+ * produces a detection.
+ */
+export class RunHistoryDetector {
+  private readonly history: RunSummary[] = [];
+  private readonly rules: RunRules;
+
+  constructor(rules: RunRules) {
+    this.rules = rules;
+  }
+
+  get runCount(): number {
     return this.history.length;
   }
 
-  observe(episode: EpisodeDigest): LoopDecision | null {
-    this.history.push(episode);
-    if (this.history.length > MAX_EPISODES) this.history.shift();
-    return detect(this.history);
+  observe(run: RunSummary): Detection | null {
+    this.history.push(run);
+    if (this.history.length > MAX_RUN_HISTORY) this.history.shift();
+    return (
+      outcomeCycle(this.history, this.rules) ??
+      repeatedError(this.history, this.rules) ??
+      similarActions(this.history, this.rules)
+    );
   }
 
   reset(): void {

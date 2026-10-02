@@ -1,11 +1,5 @@
 export default {
-  mutate: [
-    "feature-encoder.ts",
-    "intervention-message.ts",
-    "loop-detector.ts",
-    "loop-guard-controller.ts",
-    "thinking-stream-detector.ts",
-  ],
+  mutate: ["src/**/*.ts"],
   testRunner: "vitest",
   checkers: ["typescript"],
   tsconfigFile: "tsconfig.json",

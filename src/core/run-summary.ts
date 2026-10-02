@@ -1,7 +1,6 @@
 import { createHash, type Hash } from "node:crypto";
 import { basename, extname } from "node:path";
 
-export const MAX_EPISODES = 12;
 export const MAX_TURNS_PER_EPISODE = 16;
 export const MAX_ACTIONS_PER_EPISODE = 32;
 export const MAX_FEATURES_PER_EPISODE = 256;
@@ -25,7 +24,8 @@ const VOLATILE_KEYS = new Set([
 const COMMAND_KEYS = new Set(["cmd", "command"]);
 const PATH_KEYS = new Set(["file", "filePath", "path"]);
 
-export type EpisodeDigest = {
+/** What the run detectors keep about one run. Raw content is not kept. */
+export type RunSummary = {
   actionFeatures: readonly number[];
   continuationPrompt: boolean;
   exactOutcomeHash: string;
@@ -347,7 +347,8 @@ export function actionFeatureSimilarity(left: readonly number[], right: readonly
   return intersection / (left.length + right.length - intersection);
 }
 
-export class EpisodeBuilder {
+/** Collects one run's turns into a bounded `RunSummary`. */
+export class RunSummaryBuilder {
   private readonly actionFeatureSet = new Set<number>();
   private readonly outcomeHash: Hash = createHash("sha256");
   private terminalErrorFingerprint: string | null = null;
@@ -420,7 +421,7 @@ export class EpisodeBuilder {
     this.actionFeatureSet.add(hashed);
   }
 
-  finish(continuationPrompt: boolean): EpisodeDigest {
+  finish(continuationPrompt: boolean): RunSummary {
     return {
       actionFeatures: [...this.actionFeatureSet].sort((left, right) => left - right),
       continuationPrompt,
