@@ -1,9 +1,33 @@
 {
-  "name": "@onurpi/loop-guard",
+  "name": "pi-loop-guard",
   "version": "0.1.0",
-  "private": true,
-  "description": "Opt-in bounded loop detection for the Pi coding agent",
+  "description": "Opt-in detection and interruption of repeated work for the Pi coding agent",
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "loop-detection"
+  ],
+  "license": "MIT",
+  "author": "Onur Solmaz",
   "type": "module",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/osolmaz/pi-loop-guard.git"
+  },
+  "bugs": {
+    "url": "https://github.com/osolmaz/pi-loop-guard/issues"
+  },
+  "homepage": "https://github.com/osolmaz/pi-loop-guard#readme",
+  "files": [
+    "index.ts",
+    "feature-encoder.ts",
+    "intervention-message.ts",
+    "loop-detector.ts",
+    "loop-guard-controller.ts",
+    "thinking-stream-detector.ts",
+    "README.md",
+    "LICENSE"
+  ],
   "engines": {
     "node": ">=22.19.0"
   },
@@ -20,11 +44,11 @@
     "coverage": "vitest run --coverage --config vitest.config.ts",
     "dry": "slophammer-ts dry .",
     "mutate": "stryker run stryker.config.mjs",
-    "slophammer": "sh scripts/run-slophammer.sh",
-    "check": "npm run format && npm run lint && npm run typecheck && npm run test && npm run coverage && npm run dry"
+    "slophammer": "slophammer-ts check .",
+    "check": "npm run format && npm run lint && npm run typecheck && npm run test && npm run coverage && npm run dry && npm run slophammer"
   },
   "peerDependencies": {
-    "@earendil-works/pi-coding-agent": ">=0.82.1"
+    "@earendil-works/pi-coding-agent": "*"
   },
   "devDependencies": {
     "@earendil-works/pi-coding-agent": "1.0.0",
@@ -42,6 +66,6 @@
     "vitest": "5.0.2"
   },
   "overrides": {
-    "qs": "6.15.3"
+    "qs": "6.16.0"
   }
 }

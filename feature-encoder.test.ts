@@ -259,3 +259,56 @@ describe("actionFeatureSimilarity", () => {
     expect(actionFeatureSimilarity([1, 2, 3], [2, 3, 4])).toBe(0.5);
   });
 });
+
+describe("EpisodeBuilder argument canonicalization", () => {
+  function argumentDigest(args: unknown) {
+    const builder = new EpisodeBuilder();
+    builder.accountTurn(
+      {
+        role: "assistant",
+        content: [{ type: "toolCall", id: "call-1", name: "lookup", arguments: args }],
+      },
+      [],
+    );
+    return builder.finish(true);
+  }
+
+  it("distinguishes primitive argument values", () => {
+    const values = [true, false, null, 1, Number.NaN, Number.POSITIVE_INFINITY];
+    const hashes = values.map((value) => argumentDigest({ value }).exactOutcomeHash);
+
+    expect(new Set(hashes).size).toBe(values.length);
+    expect(argumentDigest({ value: undefined }).exactOutcomeHash).toBe(hashes[2]);
+  });
+
+  it("marks long arrays, wide records, and deep nesting as truncated", () => {
+    const deep = { a: { b: { c: { d: { e: { f: { g: "end" } } } } } } };
+    const wide = Object.fromEntries(
+      Array.from({ length: 25 }, (_, index) => [`k${String(index)}`, index]),
+    );
+
+    expect(
+      argumentDigest({ items: Array.from({ length: 13 }, (_, index) => index) }).truncated,
+    ).toBe(true);
+    expect(argumentDigest(wide).truncated).toBe(true);
+    expect(argumentDigest(deep).truncated).toBe(true);
+    expect(argumentDigest({ items: [1, 2, 3] }).truncated).toBe(false);
+  });
+
+  it("encodes path arguments by base name and extension", () => {
+    const typescript = argumentDigest({ path: "src/a.ts" }).actionFeatures;
+    const python = argumentDigest({ path: "src/a.py" }).actionFeatures;
+    const noExtension = argumentDigest({ path: "src/Makefile" }).actionFeatures;
+
+    expect(actionFeatureSimilarity(typescript, python)).toBeLessThan(1);
+    expect(noExtension.length).toBeLessThan(typescript.length);
+  });
+
+  it("ignores turns that are not assistant tool calls", () => {
+    const builder = new EpisodeBuilder();
+    builder.accountTurn(null, []);
+    builder.accountTurn({ role: "user", content: [] }, []);
+
+    expect(builder.finish(false).toolCalls).toBe(0);
+  });
+});

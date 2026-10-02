@@ -1,7 +1,7 @@
 import type { LoopDecision } from "./loop-detector.ts";
 
-export const LOOP_GUARD_MESSAGE_TYPE = "onurpi-loop-guard";
-export const LOOP_GUARD_EVENT = "onurpi:loop-guard";
+export const LOOP_GUARD_MESSAGE_TYPE = "pi-loop-guard";
+export const LOOP_GUARD_EVENT = "pi-loop-guard";
 
 export type LoopGuardEvent = {
   action: "nudge" | "trip";
