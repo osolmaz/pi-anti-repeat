@@ -132,8 +132,9 @@ npm run smoke
 npm run replay -- ~/.pi/agent/sessions/<dir>/<session>.jsonl
 ```
 
-`smoke` starts a real Pi process with a fake model whose thinking loops, and checks that
-Anti-Repeat cuts it off and the model answers after the correction. `replay` runs the thinking in local session files through the detector and prints which responses
+`smoke` starts real Pi processes with fake models. In one, the thinking loops and Anti-Repeat
+must cut it off. In the other, the same answer comes back three times and Anti-Repeat must correct
+it before Pi settles. Both times the model must answer after the correction. `replay` runs the thinking in local session files through the detector and prints which responses
 it would flag and how far into each one. It never prints session text. Mutation testing is manual:
 `npm run mutate`.
 
