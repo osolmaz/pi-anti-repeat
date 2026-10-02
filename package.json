@@ -1,6 +1,6 @@
 {
   "name": "pi-anti-repeat",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Detects and stops repeated work in the Pi coding agent, including loops inside streamed thinking",
   "keywords": [
     "pi-package",

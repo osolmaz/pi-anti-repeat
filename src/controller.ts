@@ -424,12 +424,15 @@ export class AntiRepeatController {
       this.unsubscribeStream();
       this.unsubscribeStream = null;
     }
+    this.showStatus();
+  }
+
+  /** Normal operation shows nothing; only states the user should notice reach the footer. */
+  private showStatus(): void {
     if (this.options.status === false || this.context === null) return;
     const state = this.state;
-    this.context.ui.setStatus(
-      this.options.status,
-      state === "off" ? undefined : `anti-repeat: ${state}`,
-    );
+    const quiet = state === "off" || state === "watching";
+    this.context.ui.setStatus(this.options.status, quiet ? undefined : `anti-repeat: ${state}`);
   }
 
   private emit(type: AntiRepeatEventType, detection?: Detection): void {

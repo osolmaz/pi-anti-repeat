@@ -138,10 +138,7 @@ describe("AntiRepeatController defaults", () => {
     const harness = started();
     expect(harness.controller.state).toBe("watching");
     expect(harness.activeSubscriptions).toBe(1);
-    expect(harness.ctx.ui.setStatus).toHaveBeenLastCalledWith(
-      "anti-repeat",
-      "anti-repeat: watching",
-    );
+    expect(harness.ctx.ui.setStatus).toHaveBeenLastCalledWith("anti-repeat", undefined);
 
     harness.controller.reset(harness.ctx);
     expect(harness.subscriptions).toBe(1);
@@ -157,6 +154,24 @@ describe("AntiRepeatController defaults", () => {
     expect(harness.activeSubscriptions).toBe(0);
     expect(harness.emitted).toEqual([]);
     expect(harness.ctx.abort).not.toHaveBeenCalled();
+  });
+});
+
+describe("AntiRepeatController status line", () => {
+  it("shows nothing while watching and shows corrections and stops", () => {
+    const harness = started();
+    for (let index = 0; index < 3; index += 1) run(harness, "python scan.py");
+    expect(harness.ctx.ui.setStatus).toHaveBeenLastCalledWith(
+      "anti-repeat",
+      "anti-repeat: corrected",
+    );
+    for (let index = 0; index < 3; index += 1) run(harness, "python scan.py");
+    expect(harness.ctx.ui.setStatus).toHaveBeenLastCalledWith(
+      "anti-repeat",
+      "anti-repeat: stopped",
+    );
+    harness.controller.reset(harness.ctx);
+    expect(harness.ctx.ui.setStatus).toHaveBeenLastCalledWith("anti-repeat", undefined);
   });
 });
 
