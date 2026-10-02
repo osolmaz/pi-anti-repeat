@@ -1,0 +1,44 @@
+name: Publish
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          registry-url: "https://registry.npmjs.org"
+      - run: npm ci
+      - name: Validate the release against package metadata
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          version="$(node -p "require('./package.json').version")"
+          if [ "$tag" != "$version" ]; then
+            echo "::error::release tag v$tag does not match package version $version"
+            exit 1
+          fi
+          git fetch origin main
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            echo "::error::the release commit is not on the default branch"
+            exit 1
+          fi
+          if npm view "pi-anti-repeat@$version" version >/dev/null 2>&1; then
+            echo "::error::version $version is already published"
+            exit 1
+          fi
+      - run: npm run check
+      - run: npm run smoke
+      - run: npm publish
