@@ -1,5 +1,9 @@
 # pi-anti-repeat
 
+<p align="center">
+  <img src="assets/cover.svg" alt="pi-anti-repeat: a Pi extension that stops an agent that is stuck repeating itself" width="880">
+</p>
+
 pi-anti-repeat is an extension for the [Pi coding agent](https://github.com/earendil-works/pi) that
 stops an agent that is stuck repeating itself. It watches the model's streamed thinking and its
 finished runs, and when the same work keeps coming back, it cuts the response off and tells the
