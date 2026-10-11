@@ -21,6 +21,7 @@ pi install git:github.com/osolmaz/pi-anti-repeat
 ```
 
 Run `/reload` in an open Pi session to load it. Add `@<commit>` or `@<tag>` to pin a version.
+Anti-Repeat needs Pi 0.87.0 or later.
 
 Anti-Repeat is on from the start of every session. It shows nothing in the footer while it is
 only watching; the status line appears after it corrects or stops a run. Use `/anti-repeat off` to turn it off for the
@@ -59,10 +60,9 @@ A long run on its own never triggers anything. Work that keeps making different 
 
 ## Cost
 
-The thinking check runs on every streamed chunk, so it is built to be cheap. Each word is hashed
-once and the window hash is updated in place, so the cost per word does not depend on the window
-size. Streaming 1 MB of thinking through the detector takes about 24 ms, or about 0.6 microseconds
-per 24-character chunk. The listener is removed while Anti-Repeat is off, paused, or stopped. Memory
+The thinking check runs on every streamed chunk, so it is built to be cheap. Streaming 1 MB of
+thinking through the detector takes about 24 ms, and the cost per word does not grow with the
+`windowWords` option. The listener is removed while Anti-Repeat is off, paused, or stopped. Memory
 stays bounded at 2,048 tracked windows per response and twelve run summaries.
 
 Anti-Repeat never stores raw model output, thinking text, or tool content. The corrective message is the only
@@ -71,6 +71,10 @@ session entry it adds.
 ## Use it from code
 
 Pi distributions can create the extension with their own options instead of installing the default:
+
+```bash
+npm install pi-anti-repeat
+```
 
 ```typescript
 import { createAntiRepeat } from "pi-anti-repeat";
@@ -127,21 +131,3 @@ pi.events.emit(ANTI_REPEAT_CONTROL_CHANNEL, {
 
 Send `ignore-next-run` just before you restart a run on purpose, for example after cutting off a
 response, so the regenerated thinking is not counted as a repeat.
-
-## Development
-
-```bash
-npm ci
-npm run check
-npm run smoke
-npm run replay -- ~/.pi/agent/sessions/<dir>/<session>.jsonl
-```
-
-`smoke` starts real Pi processes with fake models. In one, the thinking loops and Anti-Repeat
-must cut it off. In the other, the same answer comes back three times and Anti-Repeat must correct
-it before Pi settles. Both times the model must answer after the correction. `replay` runs the thinking in local session files through the detector and prints which responses
-it would flag and how far into each one. It never prints session text. Mutation testing is manual:
-`npm run mutate`.
-
-Anti-Repeat needs Pi 0.87.0 or later. The design and the evidence behind the defaults are in
-[docs/2026-10-02-anti-repeat-library-plan.md](docs/2026-10-02-anti-repeat-library-plan.md).

@@ -12,5 +12,7 @@
   for an incompatible payload change.
 - Never commit session files or text copied from them. Use synthetic loops in tests.
 - Add or update tests for every behavior change.
+- Development commands, the smoke and replay tools, and the design notes are in
+  `docs/DEVELOPMENT.md`.
 - Run `npm run check` and `git diff --check` before finishing.
 - Keep mutation testing manual unless the user explicitly requests it.
