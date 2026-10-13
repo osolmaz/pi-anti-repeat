@@ -39,8 +39,10 @@ keep the current epoch, so a loop cannot hide behind them.
 
 These checks trigger a detection:
 
-- Three separate 96-word passages each appear three times in one streamed thought. Case,
-  punctuation, whitespace, and Unicode composition do not matter.
+- Three separate 96-word passages each appear three times in one streamed thought, or one
+  sequence of up to 96 words repeats across a span of at least 288 words. Case, punctuation,
+  whitespace, and Unicode composition do not matter, apart from runs of 16 or more separator
+  characters, which count as reserved words.
 - The same cycle of one to four run outcomes repeats three times.
 - The same error ends three runs in a row.
 - Four runs started by "continue" prompts repeat at least 85% of the same actions.

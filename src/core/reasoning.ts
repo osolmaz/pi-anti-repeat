@@ -9,6 +9,17 @@ const BASE_A = 31_337;
 const BASE_B = 65_599;
 const MAX_WORD_CHARACTERS = 128;
 const NON_ASCII_WORD_CHARACTER = /^[\p{L}\p{M}\p{N}_]$/u;
+// A run of separator characters carries no content. One reserved word per this many separator
+// code units turns a punctuation flood into a word stream, at a rate that does not depend on
+// where the provider cut the stream. The value is well below MAX_WORD_CHARACTERS because words
+// carry meaning worth keeping whole, while separator runs do not.
+const SEPARATOR_WORD_CHARACTERS = 16;
+// Not a word character, so no real word can collide with it.
+const SEPARATOR_WORD = "\u0000";
+// Recent window keys kept for period discovery. The bound is fixed so the cost per word does not
+// depend on the window size, and it sits above the default window so every period up to the
+// window size is found. Recurrences at longer lags are left to the sampled table.
+const MAX_PERIOD_TRACKED = 256;
 
 type Occurrence = {
   counted: number;
@@ -35,9 +46,15 @@ function isAsciiWordCode(code: number): boolean {
  * Finds long passages that repeat inside one streamed response.
  *
  * Text arrives in arbitrary chunks. Words are letters, marks, digits, and underscores; case,
- * punctuation, whitespace, and Unicode composition do not matter. Each word is hashed once, and
- * the hash of the last `windowWords` words is updated in place, so the cost per word does not
- * depend on the window size. Only windows whose hash falls in a fixed sample are tracked.
+ * punctuation, whitespace, and Unicode composition do not matter, apart from long runs of
+ * separators, which count as reserved words. Each word is hashed once, and the hash of the last
+ * `windowWords` words is updated in place, so the cost per word does not depend on the window
+ * size. Two paths produce a detection. Diverse loops are found by the sampled table: only
+ * windows whose hash falls in a fixed sample are tracked, and several distinct windows must
+ * each repeat. Short-period loops are found directly: the last window index of every recent
+ * window key is kept, a repeat at a lag below the window size proves the stream is periodic,
+ * and one periodic span of `repeats` non-overlapping windows carries the same evidence as the
+ * sampled path needs, without sampling.
  */
 export class ReasoningRepeatDetector {
   private readonly config: ReasoningConfig;
@@ -53,6 +70,10 @@ export class ReasoningRepeatDetector {
   private hashB = 0;
   private matched = 0;
   private pendingSurrogate = "";
+  private periodLag = 0;
+  private periodRun = 0;
+  private readonly periodicWindows = new Map<number, number>();
+  private separatorRun = 0;
   private wordA = 0;
   private wordB = 0;
   private words = 0;
@@ -96,13 +117,14 @@ export class ReasoningRepeatDetector {
       const code = chunk.charCodeAt(index);
       const width = this.wordCharacterWidth(chunk, index, code);
       if (width === 0) {
-        const detection = this.endWord(chunk, start, index, nonAscii);
+        const detection = this.endSeparator(chunk, start, index, nonAscii);
         if (detection !== null) return detection;
         index += 1;
         start = index;
         nonAscii = false;
         continue;
       }
+      this.separatorRun = 0;
       nonAscii ||= code >= 128;
       index += width;
       // Long runs of word characters are split every MAX_WORD_CHARACTERS code units, counted
@@ -123,6 +145,9 @@ export class ReasoningRepeatDetector {
   finish(): Detection | null {
     if (this.detected) return null;
     this.pendingSurrogate = "";
+    // A separator run must not continue into the next thinking block, which the caller feeds
+    // after this without a reset.
+    this.separatorRun = 0;
     return this.flushCarry();
   }
 
@@ -134,6 +159,10 @@ export class ReasoningRepeatDetector {
     this.hashB = 0;
     this.matched = 0;
     this.pendingSurrogate = "";
+    this.periodLag = 0;
+    this.periodRun = 0;
+    this.periodicWindows.clear();
+    this.separatorRun = 0;
     this.words = 0;
     this.ringA.fill(0);
     this.ringB.fill(0);
@@ -147,6 +176,22 @@ export class ReasoningRepeatDetector {
     const point = chunk.codePointAt(index) ?? code;
     if (!NON_ASCII_WORD_CHARACTER.test(String.fromCodePoint(point))) return 0;
     return point > 0xffff ? 2 : 1;
+  }
+
+  /** Ends any word at a separator character, then folds long separator runs into reserved words. */
+  private endSeparator(
+    chunk: string,
+    start: number,
+    index: number,
+    nonAscii: boolean,
+  ): Detection | null {
+    const word = this.endWord(chunk, start, index, nonAscii);
+    if (word !== null) return word;
+    // Long separator runs are degenerate content. Feed them to the window machinery as reserved
+    // words so a punctuation flood is detected like any other uniform loop.
+    this.separatorRun += 1;
+    if (this.separatorRun % SEPARATOR_WORD_CHARACTERS !== 0) return null;
+    return this.addWord(SEPARATOR_WORD, false);
   }
 
   private endWord(chunk: string, start: number, end: number, nonAscii: boolean): Detection | null {
@@ -205,8 +250,58 @@ export class ReasoningRepeatDetector {
     this.words += 1;
 
     if (this.words < this.config.windowWords) return null;
+    const periodic = this.observePeriodicity();
+    if (periodic !== null) return periodic;
     if (this.hashA % this.config.sampleRate !== 0) return null;
     return this.countWindow(this.hashA * MODULUS_B + this.hashB);
+  }
+
+  /**
+   * Checks the new full window against the recent full windows. A window whose hash matches the
+   * hash from `lag` windows back proves the last `windowWords + lag` words are periodic with
+   * period `lag`, which natural text never produces, so the match needs no sampling and no
+   * non-overlap check. Consecutive matches at one lag extend the periodic span, and a span of
+   * `repeats` non-overlapping windows carries the same evidence as the sampled path asks for
+   * several distinct windows. That equivalence holds while the lag stays within the window
+   * size, so longer recurrences are left to the sampled table. The map keeps the last window
+   * index of every recent key in a fixed-size bound, so every period up to the window size is
+   * found whatever the window size.
+   */
+  private observePeriodicity(): Detection | null {
+    const index = this.words - this.config.windowWords;
+    const key = this.hashA * MODULUS_B + this.hashB;
+    const last = this.periodicWindows.get(key);
+    this.periodicWindows.delete(key);
+    this.periodicWindows.set(key, index);
+    if (this.periodicWindows.size > MAX_PERIOD_TRACKED) {
+      const oldest = this.periodicWindows.keys().next();
+      if (oldest.done !== true) this.periodicWindows.delete(oldest.value);
+    }
+    return this.extendPeriodRun(last === undefined ? 0 : index - last);
+  }
+
+  /** Extends the periodic run with a match at `lag`, and reports when the span is long enough. */
+  private extendPeriodRun(lag: number): Detection | null {
+    const periodic = lag !== 0 && lag <= this.config.windowWords ? lag : 0;
+    if (periodic === 0) {
+      this.periodLag = 0;
+      this.periodRun = 0;
+      return null;
+    }
+    this.periodRun = periodic === this.periodLag ? this.periodRun + 1 : 1;
+    this.periodLag = periodic;
+    if (this.periodRun < (this.config.repeats - 1) * this.config.windowWords - periodic + 1) {
+      return null;
+    }
+    this.detected = true;
+    return {
+      kind: "reasoning_repeat",
+      matchedWindows: this.config.matchedWindows,
+      period: periodic,
+      repeats: this.config.repeats,
+      windowWords: this.config.windowWords,
+      wordsObserved: this.words,
+    };
   }
 
   private countWindow(key: number): Detection | null {

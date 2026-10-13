@@ -5,6 +5,14 @@ import { correctionText, detectionLabel } from "../src/message.ts";
 
 const detections: Detection[] = [
   { kind: "reasoning_repeat", matchedWindows: 3, repeats: 3, windowWords: 96, wordsObserved: 887 },
+  {
+    kind: "reasoning_repeat",
+    matchedWindows: 3,
+    period: 1,
+    repeats: 3,
+    windowWords: 96,
+    wordsObserved: 288,
+  },
   { cycleLength: 2, kind: "outcome_cycle", repeats: 3 },
   { kind: "repeated_error", repeats: 3 },
   { kind: "similar_actions", runs: 4, similarity: 0.912 },
@@ -24,5 +32,19 @@ describe("correctionText", () => {
     expect(correctionText({ kind: "similar_actions", runs: 4, similarity: 0.912 })).toContain(
       "91%",
     );
+  });
+
+  it("describes a repeating sequence without claiming separate passages", () => {
+    const text = correctionText({
+      kind: "reasoning_repeat",
+      matchedWindows: 3,
+      period: 1,
+      repeats: 3,
+      windowWords: 96,
+      wordsObserved: 288,
+    });
+    expect(text).toContain("The same 1-word sequence kept repeating");
+    expect(text).toContain("at least 288 words");
+    expect(text).not.toContain("separate");
   });
 });

@@ -3,6 +3,9 @@ import type { Detection } from "./core/detection.ts";
 function evidence(detection: Detection): string {
   switch (detection.kind) {
     case "reasoning_repeat":
+      if (detection.period !== undefined) {
+        return `The same ${String(detection.period)}-word sequence kept repeating in your reasoning for at least ${String(detection.repeats * detection.windowWords)} words in one response.`;
+      }
       return `${String(detection.matchedWindows)} separate ${String(detection.windowWords)}-word passages of your reasoning each appeared ${String(detection.repeats)} times in one response.`;
     case "outcome_cycle":
       return `The same ${String(detection.cycleLength)}-run cycle of outcomes repeated ${String(detection.repeats)} times.`;

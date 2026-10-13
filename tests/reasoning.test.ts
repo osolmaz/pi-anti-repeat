@@ -53,6 +53,11 @@ function statusLoop(cycles: number): string {
   return Array.from({ length: cycles }, () => cycle).join(" ");
 }
 
+/** The recorded collapse: one token repeated behind a separator, like `= the = the = the`. */
+function tokenLoop(token: string, cycles: number): string {
+  return `= ${token}`.repeat(cycles);
+}
+
 /** Long reasoning that keeps moving: every sentence names a new step and new values. */
 function variedReasoning(sentences: number): string {
   const verbs = ["inspect", "compare", "measure", "rewrite", "verify", "trace", "profile", "split"];
@@ -152,6 +157,154 @@ describe("ReasoningRepeatDetector", () => {
     expect(detection?.kind).toBe("reasoning_repeat");
     if (detection?.kind !== "reasoning_repeat") throw new Error("Expected a detection");
     expect(detection.wordsObserved).toBeLessThan(1_000);
+  });
+});
+
+describe("ReasoningRepeatDetector uniform loops", () => {
+  it("catches a single-word loop whatever the window hash samples", () => {
+    const detection = observeChunks(detector(), irregularChunks(tokenLoop("the", 2_000)));
+
+    expect(detection).toMatchObject({ kind: "reasoning_repeat", period: 1 });
+    if (detection?.kind !== "reasoning_repeat") throw new Error("Expected a detection");
+    // The span must hold repeats non-overlapping windows, so the fire word is exact.
+    expect(detection.wordsObserved).toBe(DEFAULT_REASONING.repeats * DEFAULT_REASONING.windowWords);
+  });
+
+  it("catches a two-word loop whatever the window hash samples", () => {
+    const detection = observeChunks(detector(), irregularChunks(tokenLoop("alpha bravo", 1_000)));
+
+    expect(detection).toMatchObject({ kind: "reasoning_repeat", period: 2 });
+    if (detection?.kind !== "reasoning_repeat") throw new Error("Expected a detection");
+    expect(detection.wordsObserved).toBe(DEFAULT_REASONING.repeats * DEFAULT_REASONING.windowWords);
+  });
+
+  it("catches loops at the last periods the recent-window map covers", () => {
+    const words8 = "alpha bravo charlie delta echo foxtrot golf hotel ";
+    const words9 = `${words8}india `;
+    const detection8 = observeChunks(detector(), irregularChunks(words8.repeat(500)));
+    const detection9 = observeChunks(detector(), irregularChunks(words9.repeat(500)));
+
+    expect(detection8).toMatchObject({ kind: "reasoning_repeat", period: 8 });
+    expect(detection9).toMatchObject({ kind: "reasoning_repeat", period: 9 });
+    if (detection8?.kind !== "reasoning_repeat" || detection9?.kind !== "reasoning_repeat") {
+      throw new Error("Expected a detection");
+    }
+    expect(detection8.wordsObserved).toBe(
+      DEFAULT_REASONING.repeats * DEFAULT_REASONING.windowWords,
+    );
+    expect(detection9.wordsObserved).toBe(
+      DEFAULT_REASONING.repeats * DEFAULT_REASONING.windowWords,
+    );
+  });
+
+  it("catches a response that collapses into a punctuation flood", () => {
+    const preface = variedReasoning(10);
+    const prefaceWords = preface.trim().split(/\s+/).length;
+    const collapsed = `${preface}\n${"= ".repeat(8_000)}`;
+
+    const detection = observeChunks(detector(), irregularChunks(collapsed));
+
+    expect(detection?.kind).toBe("reasoning_repeat");
+    if (detection?.kind !== "reasoning_repeat") throw new Error("Expected a detection");
+    expect(detection.wordsObserved).toBe(
+      prefaceWords + DEFAULT_REASONING.repeats * DEFAULT_REASONING.windowWords,
+    );
+  });
+
+  it("gives the same collapse detection for any chunk boundaries", () => {
+    const collapsed = `${variedReasoning(10)}\n${"= ".repeat(8_000)}`;
+
+    const whole = observeChunks(detector(), [collapsed]);
+    const characters = observeChunks(detector(), Array.from(collapsed));
+
+    expect(whole?.kind).toBe("reasoning_repeat");
+    expect(characters).toEqual(whole);
+  });
+
+  it("catches an emoji flood split across surrogate halves", () => {
+    const collapsed = `${variedReasoning(10)}\n${"\u{1F600}".repeat(4_000)}`;
+
+    const whole = observeChunks(detector(), [collapsed]);
+    // split("") cuts every emoji into two surrogate halves, which takeChunk must rejoin.
+    const characters = observeChunks(detector(), collapsed.split(""));
+
+    expect(whole?.kind).toBe("reasoning_repeat");
+    expect(characters).toEqual(whole);
+  });
+
+  it("restarts the periodic span after the run breaks", () => {
+    const target = detector();
+    // One word short of the fire span, then one breaking word. The marker differs per segment,
+    // so no window recurs for the sampled table either, and nothing may fire.
+    const broken = Array.from(
+      { length: 40 },
+      (_, index) =>
+        `${"the ".repeat(DEFAULT_REASONING.repeats * DEFAULT_REASONING.windowWords - 1)}marker${String(index)} `,
+    ).join("");
+    expect(observeChunks(target, irregularChunks(broken))).toBeNull();
+
+    expect(observeChunks(target, irregularChunks(tokenLoop("the", 300)))?.kind).toBe(
+      "reasoning_repeat",
+    );
+  });
+
+  it("catches the same collapse again after reset", () => {
+    const target = detector();
+    const loop = tokenLoop("the", 2_000);
+    expect(observeChunks(target, irregularChunks(loop))?.kind).toBe("reasoning_repeat");
+
+    target.reset();
+
+    expect(target.wordsObserved).toBe(0);
+    expect(observeChunks(target, irregularChunks(loop))?.kind).toBe("reasoning_repeat");
+  });
+
+  it("ends a separator run at finish so the next thinking block starts clean", () => {
+    const target = detector();
+    target.observe("=".repeat(10));
+    expect(target.finish()).toBeNull();
+    target.observe("=".repeat(10));
+    target.finish();
+    expect(target.wordsObserved).toBe(0);
+
+    const joined = detector();
+    joined.observe("=".repeat(10));
+    joined.observe("=".repeat(10));
+    joined.finish();
+    expect(joined.wordsObserved).toBe(1);
+  });
+
+  it("does not fire while a punctuation flood is shorter than one window", () => {
+    const collapsed = `${variedReasoning(20)}\n${"= ".repeat(500)}\n${variedReasoning(20)}`;
+    expect(observeChunks(detector(), irregularChunks(collapsed))).toBeNull();
+  });
+
+  it("does not fire on isolated rules inside moving reasoning", () => {
+    const prose = variedReasoning(600);
+    const ruled = `${prose}\n\n${"-".repeat(72)}\n\n${"=".repeat(72)}\n\n done.`;
+    expect(observeChunks(detector(), irregularChunks(ruled))).toBeNull();
+  });
+
+  it("does not fire on tables, indented code, or a small matrix", () => {
+    const table = Array.from(
+      { length: 40 },
+      (_, index) =>
+        `| cell ${String(index)} a | cell ${String(index)} b | cell ${String(index)} c |`,
+    ).join("\n");
+    const code = Array.from(
+      { length: 40 },
+      (_, index) =>
+        `${" ".repeat(18)}value ${String(index)} = compute(input ${String(index)}, flag ${String(index)});`,
+    ).join("\n");
+    const matrix = Array.from({ length: 11 }, () => "0 ".repeat(11)).join("\n");
+    const prose = [table, code, matrix, variedReasoning(100)].join("\n\n");
+
+    expect(observeChunks(detector(), irregularChunks(prose))).toBeNull();
+  });
+
+  it("fires on a matrix large enough to be a flood of one token", () => {
+    const matrix = Array.from({ length: 32 }, () => "0 ".repeat(32)).join("\n");
+    expect(observeChunks(detector(), irregularChunks(matrix))?.kind).toBe("reasoning_repeat");
   });
 
   it("catches a cycle of long passages before the third cycle ends", () => {

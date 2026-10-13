@@ -6,6 +6,8 @@ export type Detection =
       readonly repeats: number;
       readonly matchedWindows: number;
       readonly wordsObserved: number;
+      /** Set when one short sequence repeated, instead of several passages. */
+      readonly period?: number;
     }
   | {
       readonly kind: "outcome_cycle";
