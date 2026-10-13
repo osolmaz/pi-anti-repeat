@@ -103,3 +103,14 @@ later.
 4. Integrate localpi separately with a generated factory file and `ignore-next-run` from its
    restart features.
 5. Publish to npm only after separate approval.
+
+## Addendum, 2026-10-13: uniform loops and punctuation floods
+
+Recorded GLM sessions exposed two gaps. A loop over one or two tokens shares one window hash,
+which the 1-in-8 sample usually misses, and can never reach the three-distinct-windows bar. A
+collapse into pure `= = =` punctuation emits no words at all. Two additions close the gaps,
+alongside the sampled table above. Runs of 16 separator code units now fold into the word
+stream as reserved words, so a flood becomes a uniform word stream. And the last window index
+of recent window keys is kept in a fixed-size map: a window hash repeating at a lag within the
+window size proves the stream is periodic, and a periodic span of `repeats` non-overlapping
+windows fires the same detection, without sampling. Such detections carry a `period` field.

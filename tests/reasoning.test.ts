@@ -80,6 +80,9 @@ describe("ReasoningRepeatDetector", () => {
       repeats: DEFAULT_REASONING.repeats,
       windowWords: DEFAULT_REASONING.windowWords,
     });
+    if (detection?.kind !== "reasoning_repeat") throw new Error("Expected a detection");
+    // Only the periodic path reports a period.
+    expect(detection.period).toBeUndefined();
   });
 
   it("gives the same result for any chunk boundaries", () => {
@@ -151,12 +154,16 @@ describe("ReasoningRepeatDetector", () => {
     expect(observeChunks(detector(), irregularChunks(variedReasoning(3_000)))).toBeNull();
   });
 
-  it("catches a recorded-style status loop within the first 1,000 words", () => {
+  it("catches a recorded-style status loop at the exact periodic span", () => {
     const detection = observeChunks(detector(), irregularChunks(statusLoop(375)));
 
     expect(detection?.kind).toBe("reasoning_repeat");
     if (detection?.kind !== "reasoning_repeat") throw new Error("Expected a detection");
-    expect(detection.wordsObserved).toBeLessThan(1_000);
+    // The cycle is periodic from the first word, so the span fills at repeats windows. The
+    // detector counts "re-invoking" as two words, making the cycle 71 words long.
+    const cycleWords = statusLoop(1).match(/[\p{L}\p{N}_]+/gu)?.length ?? 0;
+    expect(detection.wordsObserved).toBe(DEFAULT_REASONING.repeats * DEFAULT_REASONING.windowWords);
+    expect(detection.period).toBe(cycleWords);
   });
 });
 
@@ -178,7 +185,7 @@ describe("ReasoningRepeatDetector uniform loops", () => {
     expect(detection.wordsObserved).toBe(DEFAULT_REASONING.repeats * DEFAULT_REASONING.windowWords);
   });
 
-  it("catches loops at the last periods the recent-window map covers", () => {
+  it("catches short-period loops at their exact span", () => {
     const words8 = "alpha bravo charlie delta echo foxtrot golf hotel ";
     const words9 = `${words8}india `;
     const detection8 = observeChunks(detector(), irregularChunks(words8.repeat(500)));
@@ -196,7 +203,53 @@ describe("ReasoningRepeatDetector uniform loops", () => {
       DEFAULT_REASONING.repeats * DEFAULT_REASONING.windowWords,
     );
   });
+});
 
+describe("ReasoningRepeatDetector period boundaries", () => {
+  it("catches every period up to the window size within the span", () => {
+    for (let period = 1; period <= DEFAULT_REASONING.windowWords; period += 1) {
+      const cycle = `${Array.from({ length: period }, (_, index) => `w${String(index)}`).join(" ")} `;
+      const detection = observeChunks(detector(), irregularChunks(cycle.repeat(500)));
+
+      expect(detection?.kind).toBe("reasoning_repeat");
+      if (detection?.kind !== "reasoning_repeat") throw new Error(`period ${String(period)}`);
+      // Small periods are caught by the periodic path at exactly the span, with the period
+      // reported; larger ones may be caught earlier by the sampled table, which reports no
+      // period. Either way the span never has to grow past repeats windows.
+      expect(detection.wordsObserved).toBeLessThanOrEqual(
+        DEFAULT_REASONING.repeats * DEFAULT_REASONING.windowWords,
+      );
+      if (detection.period !== undefined) expect(detection.period).toBe(period);
+    }
+  });
+
+  it("hands periods past the window size to the sampled table", () => {
+    const cycle = `${Array.from({ length: 97 }, (_, index) => `w${String(index)}`).join(" ")} `;
+    const detection = observeChunks(detector(), irregularChunks(cycle.repeat(40)));
+
+    expect(detection?.kind).toBe("reasoning_repeat");
+    if (detection?.kind !== "reasoning_repeat") throw new Error("Expected a detection");
+    expect(detection.period).toBeUndefined();
+  });
+
+  it("finds periods at the tracked bound with a larger window", () => {
+    const config = resolveDetectorConfig({ reasoning: { windowWords: 512 } }).reasoning;
+    if (config === false) throw new Error("Expected a reasoning config");
+    const cycle = `${Array.from({ length: 256 }, (_, index) => `v${String(index)}`).join(" ")} `;
+    const detection = observeChunks(
+      new ReasoningRepeatDetector(config),
+      irregularChunks(cycle.repeat(40)),
+    );
+
+    expect(detection).toMatchObject({
+      kind: "reasoning_repeat",
+      period: 256,
+      wordsObserved: 1_536,
+    });
+  });
+});
+
+describe("ReasoningRepeatDetector uniform loop detections", () => {
   it("catches a response that collapses into a punctuation flood", () => {
     const preface = variedReasoning(10);
     const prefaceWords = preface.trim().split(/\s+/).length;
@@ -235,7 +288,9 @@ describe("ReasoningRepeatDetector uniform loops", () => {
   it("restarts the periodic span after the run breaks", () => {
     const target = detector();
     // One word short of the fire span, then one breaking word. The marker differs per segment,
-    // so no window recurs for the sampled table either, and nothing may fire.
+    // so no window recurs for the sampled table either, and nothing may fire. The all-"the"
+    // window recurs, but one distinct window cannot reach the three distinct windows the
+    // sampled path needs.
     const broken = Array.from(
       { length: 40 },
       (_, index) =>
@@ -243,8 +298,10 @@ describe("ReasoningRepeatDetector uniform loops", () => {
     ).join("");
     expect(observeChunks(target, irregularChunks(broken))).toBeNull();
 
-    expect(observeChunks(target, irregularChunks(tokenLoop("the", 300)))?.kind).toBe(
-      "reasoning_repeat",
+    const detection = observeChunks(target, irregularChunks(tokenLoop("the", 300)));
+    if (detection?.kind !== "reasoning_repeat") throw new Error("Expected a detection");
+    expect(detection.wordsObserved).toBe(
+      41 * DEFAULT_REASONING.repeats * DEFAULT_REASONING.windowWords,
     );
   });
 
@@ -273,7 +330,9 @@ describe("ReasoningRepeatDetector uniform loops", () => {
     joined.finish();
     expect(joined.wordsObserved).toBe(1);
   });
+});
 
+describe("ReasoningRepeatDetector punctuation handling", () => {
   it("does not fire while a punctuation flood is shorter than one window", () => {
     const collapsed = `${variedReasoning(20)}\n${"= ".repeat(500)}\n${variedReasoning(20)}`;
     expect(observeChunks(detector(), irregularChunks(collapsed))).toBeNull();
@@ -347,6 +406,8 @@ describe("ReasoningRepeatDetector uniform loops", () => {
     }
 
     expect(target.trackedWindows).toBeLessThanOrEqual(DEFAULT_REASONING.maxTrackedWindows);
+    // Recent window keys for period discovery are bounded independently of the window size.
+    expect(target.periodTracked).toBeLessThanOrEqual(256);
     expect(target.wordsObserved).toBe(50_000);
   });
 

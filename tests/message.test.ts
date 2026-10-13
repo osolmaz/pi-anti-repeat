@@ -43,7 +43,7 @@ describe("correctionText", () => {
       windowWords: 96,
       wordsObserved: 288,
     });
-    expect(text).toContain("The same 1-word sequence kept repeating");
+    expect(text).toContain("The same short sequence of words or symbols kept repeating");
     expect(text).toContain("at least 288 words");
     expect(text).not.toContain("separate");
   });

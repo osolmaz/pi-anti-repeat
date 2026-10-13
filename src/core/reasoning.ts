@@ -63,6 +63,7 @@ export class ReasoningRepeatDetector {
   private readonly ringA: Uint32Array;
   private readonly ringB: Uint32Array;
   private readonly tracked = new Map<number, Occurrence>();
+  private readonly periodicWindows = new Map<number, number>();
   private carry = "";
   private carryNonAscii = false;
   private detected = false;
@@ -72,7 +73,6 @@ export class ReasoningRepeatDetector {
   private pendingSurrogate = "";
   private periodLag = 0;
   private periodRun = 0;
-  private readonly periodicWindows = new Map<number, number>();
   private separatorRun = 0;
   private wordA = 0;
   private wordB = 0;
@@ -92,6 +92,10 @@ export class ReasoningRepeatDetector {
 
   get trackedWindows(): number {
     return this.tracked.size;
+  }
+
+  get periodTracked(): number {
+    return this.periodicWindows.size;
   }
 
   /** Adds one streamed chunk. Returns a detection once, then ignores input until `reset`. */
@@ -264,8 +268,8 @@ export class ReasoningRepeatDetector {
    * `repeats` non-overlapping windows carries the same evidence as the sampled path asks for
    * several distinct windows. That equivalence holds while the lag stays within the window
    * size, so longer recurrences are left to the sampled table. The map keeps the last window
-   * index of every recent key in a fixed-size bound, so every period up to the window size is
-   * found whatever the window size.
+   * index of the most recent keys under a fixed bound, so periods up to the smaller of the
+   * window size and the bound are found, whatever the window size.
    */
   private observePeriodicity(): Detection | null {
     const index = this.words - this.config.windowWords;
@@ -293,15 +297,20 @@ export class ReasoningRepeatDetector {
     if (this.periodRun < (this.config.repeats - 1) * this.config.windowWords - periodic + 1) {
       return null;
     }
+    return this.reasoningDetection(periodic);
+  }
+
+  /** Reports one detection once, then ignores input until `reset`. */
+  private reasoningDetection(period: number | undefined): Detection {
     this.detected = true;
-    return {
+    const detection: Detection = {
       kind: "reasoning_repeat",
       matchedWindows: this.config.matchedWindows,
-      period: periodic,
       repeats: this.config.repeats,
       windowWords: this.config.windowWords,
       wordsObserved: this.words,
     };
+    return period === undefined ? detection : { ...detection, period };
   }
 
   private countWindow(key: number): Detection | null {
@@ -323,13 +332,6 @@ export class ReasoningRepeatDetector {
     occurrence.evidenced = true;
     this.matched += 1;
     if (this.matched < this.config.matchedWindows) return null;
-    this.detected = true;
-    return {
-      kind: "reasoning_repeat",
-      matchedWindows: this.config.matchedWindows,
-      repeats: this.config.repeats,
-      windowWords: this.config.windowWords,
-      wordsObserved: this.words,
-    };
+    return this.reasoningDetection(undefined);
   }
 }

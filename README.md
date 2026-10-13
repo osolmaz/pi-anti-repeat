@@ -41,8 +41,8 @@ These checks trigger a detection:
 
 - Three separate 96-word passages each appear three times in one streamed thought, or one
   sequence of up to 96 words repeats across a span of at least 288 words. Case, punctuation,
-  whitespace, and Unicode composition do not matter, apart from runs of 16 or more separator
-  characters, which count as reserved words.
+  whitespace, and Unicode composition do not matter, apart from separator runs: each 16
+  separator characters in a row count as one reserved word, and an emoji counts as two.
 - The same cycle of one to four run outcomes repeats three times.
 - The same error ends three runs in a row.
 - Four runs started by "continue" prompts repeat at least 85% of the same actions.
@@ -63,9 +63,10 @@ A long run on its own never triggers anything. Work that keeps making different 
 ## Cost
 
 The thinking check runs on every streamed chunk, so it is built to be cheap. Streaming 1 MB of
-thinking through the detector takes about 24 ms, and the cost per word does not grow with the
+thinking through the detector takes about 50 ms, and the cost per word does not grow with the
 `windowWords` option. The listener is removed while Anti-Repeat is off, paused, or stopped. Memory
-stays bounded at 2,048 tracked windows per response and twelve run summaries.
+stays bounded at 2,048 tracked windows and 256 recent window keys per response, and twelve run
+summaries.
 
 Anti-Repeat never stores raw model output, thinking text, or tool content. The corrective message is the only
 session entry it adds.
