@@ -9,19 +9,30 @@ stops an agent that is stuck repeating itself. It watches the model's streamed t
 finished runs, and when the same work keeps coming back, it cuts the response off and tells the
 model to change its approach.
 
-It catches loops inside a single thought as it streams. In one recorded case a model spent 74
-seconds writing the same five sentences about 375 times. Replayed through the detector, that
-response is stopped after 866 words, about 5 seconds in. It also catches runs that end with the
-same outcome or the same error again and again.
+It catches loops inside a single thought as it streams, including the two ways streaming models
+collapse in practice: a phrase or single token repeated forever (such as `= the = the = the`),
+and reasoning that falls apart into runs of punctuation (such as `= = = =`). In one recorded
+case a model spent 74 seconds writing the same five sentences about 375 times. Replayed through
+the detector, that response is stopped after 866 words, about 5 seconds in. A response that
+collapsed into 72 KB of `= the` is stopped within the first 500 words. It also catches runs that
+end with the same outcome or the same error again and again.
 
 ## Install
+
+pi-anti-repeat is an npm package:
+
+```bash
+pi install npm:pi-anti-repeat
+```
+
+Or install from Git:
 
 ```bash
 pi install git:github.com/osolmaz/pi-anti-repeat
 ```
 
-Run `/reload` in an open Pi session to load it. Add `@<commit>` or `@<tag>` to pin a version.
-Anti-Repeat needs Pi 0.87.0 or later.
+Run `/reload` in an open Pi session to load it. Add `@<version>`, `@<tag>`, or `@<commit>` to pin
+a version. Anti-Repeat needs Pi 0.87.0 or later.
 
 Anti-Repeat is on from the start of every session. It shows nothing in the footer while it is
 only watching; the status line appears after it corrects or stops a run. Use `/anti-repeat off` to turn it off for the
